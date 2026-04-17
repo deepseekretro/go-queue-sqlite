@@ -166,16 +166,20 @@ type WsControl struct {
 }
 
 type WsWorker struct {
-	id     string
-	queue  string
-	send   chan []byte
-	result chan WsResultMessage
-	done   chan struct{}
+	id           string
+	queue        string
+	send         chan []byte
+	result       chan WsResultMessage
+	done         chan struct{}
+	currentJobID int64  // 当前正在处理的任务 ID，断连时用于放回 pending
+	idle         bool   // true = 空闲，可接受新任务
 }
 
 type WorkerHub struct {
 	mu      sync.Mutex
 	workers map[string]*WsWorker
+	rrKeys  []string // round-robin 顺序
+	rrIdx   int      // round-robin 当前索引
 }
 
 var hub = &WorkerHub{workers: make(map[string]*WsWorker)}
@@ -183,7 +187,9 @@ var hub = &WorkerHub{workers: make(map[string]*WsWorker)}
 func (h *WorkerHub) register(w *WsWorker) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	w.idle = true
 	h.workers[w.id] = w
+	h.rrKeys = append(h.rrKeys, w.id)
 	log.Printf("[Hub] Worker registered: id=%s queue=%s total=%d", w.id, w.queue, len(h.workers))
 }
 
@@ -191,6 +197,16 @@ func (h *WorkerHub) unregister(id string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.workers, id)
+	// 从 rrKeys 中移除
+	for i, k := range h.rrKeys {
+		if k == id {
+			h.rrKeys = append(h.rrKeys[:i], h.rrKeys[i+1:]...)
+			if h.rrIdx >= len(h.rrKeys) && h.rrIdx > 0 {
+				h.rrIdx = 0
+			}
+			break
+		}
+	}
 	log.Printf("[Hub] Worker unregistered: id=%s total=%d", id, len(h.workers))
 }
 
@@ -203,21 +219,38 @@ func (h *WorkerHub) count() int {
 func (h *WorkerHub) dispatchToWs(j *Job) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for _, w := range h.workers {
-		if w.queue == j.Queue || w.queue == "" {
-			msg := WsJobMessage{
-				Type:    "job",
-				JobID:   j.ID,
-				Queue:   j.Queue,
-				JobType: j.JobType(),
-				Payload: j.Payload,
-			}
-			b, _ := json.Marshal(msg)
-			select {
-			case w.send <- b:
-				return true
-			default:
-			}
+	n := len(h.rrKeys)
+	if n == 0 {
+		return false
+	}
+	// round-robin：从当前索引开始，遍历一圈找第一个 idle worker
+	for i := 0; i < n; i++ {
+		idx := (h.rrIdx + i) % n
+		w, ok := h.workers[h.rrKeys[idx]]
+		if !ok {
+			continue
+		}
+		if !w.idle {
+			continue // 该 worker 正忙，跳过
+		}
+		if w.queue != j.Queue && w.queue != "" {
+			continue
+		}
+		msg := WsJobMessage{
+			Type:    "job",
+			JobID:   j.ID,
+			Queue:   j.Queue,
+			JobType: j.JobType(),
+			Payload: j.Payload,
+		}
+		b, _ := json.Marshal(msg)
+		select {
+		case w.send <- b:
+			w.idle = false          // 标记为忙碌
+			w.currentJobID = j.ID   // 记录当前任务
+			h.rrIdx = (idx + 1) % n // 下次从下一个开始
+			return true
+		default:
 		}
 	}
 	return false
@@ -272,8 +305,8 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	worker := &WsWorker{
 		id:     workerID,
 		queue:  queue,
-		send:   make(chan []byte, 4),
-		result: make(chan WsResultMessage, 4),
+		send:   make(chan []byte, 1), // size=1：一次只处理一个任务，防止积压
+		result: make(chan WsResultMessage, 1),
 		done:   make(chan struct{}),
 	}
 	hub.register(worker)
@@ -307,19 +340,38 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
+	// rescheduleCurrentJob 把当前任务放回 pending（断连/超时时调用）
+	rescheduleCurrentJob := func(reason string) {
+		hub.mu.Lock()
+		jobID := worker.currentJobID
+		hub.mu.Unlock()
+		if jobID > 0 {
+			db.Exec(`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=? WHERE id=? AND status='running'`,
+				time.Now().Unix(), jobID)
+			log.Printf("[WS] Worker %s %s — job #%d put back to pending", workerID, reason, jobID)
+		}
+	}
+
 	for {
 		select {
 		case <-worker.done:
+			rescheduleCurrentJob("disconnected")
 			log.Printf("[WS] Worker %s disconnected", workerID)
 			return
 		case jobMsg := <-worker.send:
 			if err := conn.WriteMessage(1, jobMsg); err != nil {
 				log.Printf("[WS] write error: %v", err)
+				rescheduleCurrentJob("write error")
 				return
 			}
 			log.Printf("[WS] Job sent to worker %s", workerID)
 			select {
 			case result := <-worker.result:
+				// 处理完毕，标记 worker 为 idle
+				hub.mu.Lock()
+				worker.idle = true
+				worker.currentJobID = 0
+				hub.mu.Unlock()
 				if result.Success {
 					markDone(result.JobID)
 					log.Printf("[WS] Job #%d done by worker %s: %s", result.JobID, workerID, result.Log)
@@ -333,9 +385,11 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 					log.Printf("[WS] Job #%d failed by worker %s: %s", result.JobID, workerID, result.Error)
 				}
 			case <-time.After(30 * time.Second):
-				log.Printf("[WS] Worker %s timed out", workerID)
+				rescheduleCurrentJob("30s timeout")
+				log.Printf("[WS] Worker %s timed out, disconnecting", workerID)
 				return
 			case <-worker.done:
+				rescheduleCurrentJob("disconnected while processing")
 				return
 			}
 		}
