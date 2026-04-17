@@ -49,7 +49,7 @@ func initDB() {
 	if _, err = db.Exec(schema); err != nil {
 		log.Fatal(err)
 	}
-	log.Println("[DB] SQLite (pure Go / modernc.org/sqlite) initialized")
+	log.Println("[DB] SQLite (pure Go / modernc.org/sqlite) initialized ✓")
 }
 
 // ─────────────────────────────────────────────
