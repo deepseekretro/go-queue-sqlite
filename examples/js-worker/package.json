@@ -1,0 +1,13 @@
+{
+  "name": "goqueue-js-worker",
+  "version": "1.0.0",
+  "description": "GoQueue JavaScript Worker example (Node.js)",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "ws": "^8.0.0"
+  },
+  "license": "MIT"
+}
