@@ -1,6 +1,10 @@
 package main
 
-import "net/http"
+import (
+	"log"
+	"net/http"
+	"time"
+)
 
 // ─────────────────────────────────────────────
 // P3-2: 多后端支持 (QueueBackend interface)
@@ -118,5 +122,49 @@ func handleBackendInfo(w http.ResponseWriter, r *http.Request) {
 		"backend": DefaultBackend.Name(),
 		"stats":   stats,
 		"supported_backends": []string{"sqlite", "redis (planned)", "mysql (planned)", "postgresql (planned)"},
+	})
+}
+
+// handleDBReset POST /api/db/reset — 清空所有任务数据，重置数据库到初始状态
+func handleDBReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	// 在事务中执行所有清空操作
+	tx, err := db.Begin()
+	if err != nil {
+		jsonResp(w, 500, map[string]string{"error": "begin tx: " + err.Error()})
+		return
+	}
+	defer tx.Rollback()
+
+	stmts := []string{
+		"DELETE FROM jobs",
+		"DELETE FROM sqlite_sequence WHERE name='jobs'",
+		"DELETE FROM batches",
+		"DELETE FROM sqlite_sequence WHERE name='batches'",
+		"DELETE FROM job_chains",
+		"DELETE FROM sqlite_sequence WHERE name='job_chains'",
+	}
+	for _, s := range stmts {
+		if _, err := tx.Exec(s); err != nil {
+			// sqlite_sequence 行不存在时忽略错误（表可能从未插入过数据）
+			if s[:6] != "DELETE" || err.Error() != "no such table: sqlite_sequence" {
+				// 只忽略 sqlite_sequence 相关的"no such table"错误
+			}
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		jsonResp(w, 500, map[string]string{"error": "commit: " + err.Error()})
+		return
+	}
+
+	log.Printf("[API] Database reset by admin")
+	jsonResp(w, 200, map[string]interface{}{
+		"message": "Database reset successfully. All jobs, batches and chains have been cleared.",
+		"reset_at": time.Now().Unix(),
 	})
 }

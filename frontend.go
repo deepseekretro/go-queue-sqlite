@@ -119,6 +119,7 @@ const indexHTML = `<!DOCTYPE html>
     <span class="dot dot-running"></span>
     <span style="font-size:.8rem;color:#34d399">Server Active</span>
     <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;" onclick="loadAll()">↻ Refresh</button>
+    <button class="btn btn-sm" style="background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5;" onclick="confirmDBReset()">🗑 重置数据库</button>
     <div style="display:flex;align-items:center;gap:8px;margin-left:8px;padding-left:12px;border-left:1px solid #334155;">
       <span style="font-size:.8rem;color:#94a3b8;">👤 <span id="current-user">admin</span></span>
       <a href="/logout" style="font-size:.8rem;padding:5px 12px;background:#7f1d1d;border:1px solid #991b1b;color:#fca5a5;border-radius:6px;text-decoration:none;transition:opacity .2s;" onmouseover="this.style.opacity='.8'" onmouseout="this.style.opacity='1'">登出</a>
@@ -812,6 +813,33 @@ async function clearFailed() {
   const j = await res.json();
   toast('🗑 ' + j.message);
   loadAll();
+}
+
+async function confirmDBReset() {
+  const confirmed = confirm(
+    '⚠️ 确认重置数据库？\n\n' +
+    '此操作将清空所有 Jobs、Batches 和 Job Chains 数据，\n' +
+    '且无法撤销。\n\n' +
+    '确定要继续吗？'
+  );
+  if (!confirmed) return;
+
+  // 二次确认
+  const confirmed2 = confirm('再次确认：所有任务数据将被永久删除，继续？');
+  if (!confirmed2) return;
+
+  try {
+    const res = await fetch('/api/db/reset', { method: 'POST' });
+    const data = await res.json();
+    if (res.ok) {
+      toast('✅ 数据库已重置，所有任务数据已清空');
+      loadAll();
+    } else {
+      toast('❌ 重置失败：' + (data.error || '未知错误'), true);
+    }
+  } catch (e) {
+    toast('❌ 请求失败：' + e.message, true);
+  }
 }
 
 function loadAll() { loadStats(); loadJobs(); }

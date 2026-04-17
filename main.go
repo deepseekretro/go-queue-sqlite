@@ -956,7 +956,13 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer rows.Close()
-	stats := map[string]interface{}{}
+	// 预设默认值，确保表为空时也返回 0 而非 null
+	stats := map[string]interface{}{
+		"pending": 0,
+		"running": 0,
+		"done":    0,
+		"failed":  0,
+	}
 	for rows.Next() {
 		var s string
 		var c int
@@ -1290,6 +1296,7 @@ func main() {
 	mux.HandleFunc("/api/backend", cors(auth(handleBackendInfo)))    // P3-2: 后端信息
 	mux.HandleFunc("/api/autoscale", cors(auth(handleAutoScale)))    // P3-3: 动态扩缩容
 	mux.HandleFunc("/api/stats", cors(auth(handleStats)))
+	mux.HandleFunc("/api/db/reset", cors(auth(handleDBReset)))
 	mux.HandleFunc("/api/me", requireLogin(handleMe))
 	mux.HandleFunc("/api/events", requireLogin(handleSSE))
 	mux.HandleFunc("/api/jobs/failed", cors(auth(handleClearFailed)))
