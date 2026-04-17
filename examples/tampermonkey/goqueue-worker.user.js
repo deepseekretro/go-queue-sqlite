@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GoQueue Worker Panel
 // @namespace    https://github.com/deepseekretro/go-queue-sqlite
-// @version      2.0.0
+// @version      3.0.0
 // @description  在页面右上角显示 GoQueue Worker 控制面板，实时展示连接状态与任务日志
 // @author       GoQueue
 // @match        *://*/*
@@ -14,15 +14,20 @@
 (function () {
   'use strict';
 
-  // ─── 持久化配置 ────────────────────────────────────────────────────────────
-  const CFG = {
-    get serverUrl()      { return GM_getValue('gq_server',    'ws://localhost:8080/ws/worker'); },
-    get queue()          { return GM_getValue('gq_queue',     'default'); },
-    get apiKey()         { return GM_getValue('gq_api_key',   ''); },
-    get pingInterval()   { return GM_getValue('gq_ping',      20000); },
-    get reconnectDelay() { return GM_getValue('gq_reconnect', 3000); },
-    get autoStart()      { return GM_getValue('gq_autostart', false); },
-  };
+  // ─── 配置读写（带明确默认值，避免 GM_getValue 沙箱返回空值）────────────────
+  const DEFAULT_SERVER = 'ws://localhost:8080/ws/worker';
+  const DEFAULT_QUEUE  = 'default';
+
+  function getCfg() {
+    return {
+      serverUrl:      GM_getValue('gq_server',    DEFAULT_SERVER) || DEFAULT_SERVER,
+      queue:          GM_getValue('gq_queue',     DEFAULT_QUEUE)  || DEFAULT_QUEUE,
+      apiKey:         GM_getValue('gq_api_key',   '') || '',
+      pingInterval:   GM_getValue('gq_ping',      20000) || 20000,
+      reconnectDelay: GM_getValue('gq_reconnect', 3000)  || 3000,
+      autoStart:      GM_getValue('gq_autostart', false),
+    };
+  }
 
   // ─── 状态 ─────────────────────────────────────────────────────────────────
   let ws          = null;
@@ -137,6 +142,7 @@
       color: #475569;
       border-bottom: 1px solid #1e293b;
       line-height: 1.6;
+      word-break: break-all;
     }
     #gq-info span { color: #64748b; }
 
@@ -218,7 +224,7 @@
     }
   `);
 
-  // ─── 面板 HTML ─────────────────────────────────────────────────────────────
+  // ─── 面板 HTML（不在模板字符串里调用 GM_getValue，避免沙箱时序问题）────────
   const panel = document.createElement('div');
   panel.id = 'gq-panel';
   panel.innerHTML = `
@@ -240,8 +246,8 @@
         <button class="gq-btn gq-btn-config" id="gq-btn-config">⚙ 配置</button>
       </div>
       <div id="gq-info">
-        队列：<span id="gq-info-queue">${CFG.queue}</span> &nbsp;|&nbsp;
-        服务端：<span id="gq-info-server">${shortUrl(CFG.serverUrl)}</span>
+        队列：<span id="gq-info-queue">-</span> &nbsp;|&nbsp;
+        服务端：<span id="gq-info-server">-</span>
       </div>
       <div id="gq-log-header">
         日志
@@ -289,6 +295,15 @@
   const $infoQueue  = panel.querySelector('#gq-info-queue');
   const $infoServer = panel.querySelector('#gq-info-server');
 
+  // ─── 初始化：读取配置后填充 info 行（避免在 innerHTML 模板里调用 GM_getValue）
+  function refreshInfoBar() {
+    const cfg = getCfg();
+    $infoQueue.textContent  = cfg.queue;
+    $infoServer.textContent = shortUrl(cfg.serverUrl);
+    $infoServer.title       = cfg.serverUrl;
+  }
+  refreshInfoBar();
+
   // ─── 折叠 ─────────────────────────────────────────────────────────────────
   $collapseBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -298,9 +313,10 @@
 
   // ─── 配置弹层 ─────────────────────────────────────────────────────────────
   $btnConfig.addEventListener('click', () => {
-    $cfgServer.value = CFG.serverUrl;
-    $cfgQueue.value  = CFG.queue;
-    $cfgApiKey.value = CFG.apiKey;
+    const cfg = getCfg();
+    $cfgServer.value = cfg.serverUrl;
+    $cfgQueue.value  = cfg.queue;
+    $cfgApiKey.value = cfg.apiKey;
     $modal.classList.add('open');
   });
   panel.querySelector('#cfg-cancel').addEventListener('click', () => {
@@ -308,16 +324,25 @@
   });
   panel.querySelector('#cfg-save').addEventListener('click', () => {
     const server = $cfgServer.value.trim();
-    const queue  = $cfgQueue.value.trim() || 'default';
+    const queue  = $cfgQueue.value.trim() || DEFAULT_QUEUE;
     const apiKey = $cfgApiKey.value.trim();
-    if (!server) { $cfgServer.focus(); return; }
+
+    // 校验：必须是合法的 ws:// 或 wss:// 地址
+    if (!server.startsWith('ws://') && !server.startsWith('wss://')) {
+      $cfgServer.style.borderColor = '#ef4444';
+      $cfgServer.focus();
+      addLog('地址必须以 ws:// 或 wss:// 开头', 'error');
+      return;
+    }
+    $cfgServer.style.borderColor = '';
+
     GM_setValue('gq_server',  server);
     GM_setValue('gq_queue',   queue);
     GM_setValue('gq_api_key', apiKey);
-    $infoQueue.textContent  = queue;
-    $infoServer.textContent = shortUrl(server);
+
+    refreshInfoBar();
     $modal.classList.remove('open');
-    addLog('配置已保存，重新启动后生效', 'warn');
+    addLog(`配置已保存 → ${server}  queue=${queue}`, 'warn');
   });
 
   // ─── 启动 / 停止按钮 ──────────────────────────────────────────────────────
@@ -346,13 +371,11 @@
 
   // ─── 日志工具 ─────────────────────────────────────────────────────────────
   function addLog(msg, level = 'info') {
-    const now  = new Date();
-    const time = now.toTimeString().slice(0, 8);
+    const time = new Date().toTimeString().slice(0, 8);
     const line = document.createElement('div');
     line.className = 'gq-log-line';
     line.innerHTML = `<span class="gq-log-time">${time}</span><span class="gq-log-msg ${level}">${escHtml(msg)}</span>`;
     $log.appendChild(line);
-    // 最多保留 200 条
     while ($log.children.length > 200) $log.removeChild($log.firstChild);
     $log.scrollTop = $log.scrollHeight;
   }
@@ -370,10 +393,9 @@
   }
 
   // ─── Job Handlers ─────────────────────────────────────────────────────────
-  // 在此注册你的任务处理函数：job_type → async function(data) → string
   const handlers = {
     /**
-     * 抓取网页内容（利用浏览器 fetch，可绕过部分跨域限制）
+     * 抓取网页内容
      * 投递：{"queue":"default","job_type":"fetch_url","data":{"url":"https://example.com"}}
      */
     fetch_url: async (data) => {
@@ -383,7 +405,7 @@
     },
 
     /**
-     * 延迟执行（模拟耗时任务）
+     * 延迟执行
      * 投递：{"queue":"default","job_type":"delay","data":{"ms":1000,"message":"hello"}}
      */
     delay: async (data) => {
@@ -416,28 +438,44 @@
 
   function connect() {
     if (stopped) return;
-    const url = `${CFG.serverUrl}?queue=${CFG.queue}`;
+
+    // 每次 connect 时重新读取配置，确保使用最新值
+    const cfg = getCfg();
+    const serverUrl = cfg.serverUrl;
+    const queue     = cfg.queue;
+
+    // 防御：地址必须是合法的 ws:// 或 wss:// 绝对 URL
+    if (!serverUrl || (!serverUrl.startsWith('ws://') && !serverUrl.startsWith('wss://'))) {
+      setDot('disconnected', '配置错误');
+      addLog(`服务端地址无效: "${serverUrl}"，请点击 ⚙ 配置`, 'error');
+      stopped = true;
+      $btnStart.disabled = false;
+      $btnStop.disabled  = true;
+      return;
+    }
+
+    const url = `${serverUrl}?queue=${encodeURIComponent(queue)}`;
     setDot('connecting', '连接中...');
-    addLog(`连接 ${url}`, 'info');
+    addLog(`连接 → ${url}`, 'info');
 
     try {
       ws = new WebSocket(url);
     } catch (e) {
       addLog(`WebSocket 初始化失败: ${e.message}`, 'error');
-      scheduleReconnect();
+      scheduleReconnect(cfg);
       return;
     }
 
     ws.onopen = () => {
-      setDot('connected', `已连接 · ${CFG.queue}`);
-      addLog(`已连接，队列=${CFG.queue}`, 'success');
+      setDot('connected', `已连接 · ${queue}`);
+      addLog(`已连接，队列=${queue}`, 'success');
 
       // 心跳：每 20s 发一次 JSON ping，防止连接被中间代理超时断开
       pingTimer = setInterval(() => {
         if (ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'ping' }));
         }
-      }, CFG.pingInterval);
+      }, cfg.pingInterval);
     };
 
     ws.onmessage = async (event) => {
@@ -467,18 +505,19 @@
       if (!stopped) {
         setDot('disconnected', '已断开，重连中...');
         addLog('连接断开，等待重连...', 'warn');
-        scheduleReconnect();
+        scheduleReconnect(cfg);
       }
     };
 
     ws.onerror = () => {
-      addLog('WebSocket 连接错误', 'error');
+      addLog('WebSocket 连接错误（检查服务端地址和网络）', 'error');
     };
   }
 
   async function handleJob(msg) {
     const jobId   = msg.job_id;
     const jobType = msg.job_type;
+    const cfg     = getCfg();
 
     let payload, data;
     try {
@@ -495,7 +534,7 @@
     if (!handler) {
       failCount++;
       updateBadges();
-      setDot('connected', `已连接 · ${CFG.queue}`);
+      setDot('connected', `已连接 · ${cfg.queue}`);
       addLog(`无 handler: "${jobType}"`, 'error');
       return sendResult(jobId, false, '', `No handler for job_type: "${jobType}"`);
     }
@@ -504,13 +543,13 @@
       const result = await handler(data);
       jobCount++;
       updateBadges();
-      setDot('connected', `已连接 · ${CFG.queue}`);
+      setDot('connected', `已连接 · ${cfg.queue}`);
       addLog(`#${jobId} ✓ ${result}`, 'success');
       sendResult(jobId, true, result, '');
     } catch (err) {
       failCount++;
       updateBadges();
-      setDot('connected', `已连接 · ${CFG.queue}`);
+      setDot('connected', `已连接 · ${cfg.queue}`);
       addLog(`#${jobId} ✗ ${err.message}`, 'error');
       sendResult(jobId, false, '', err.message);
     }
@@ -532,14 +571,15 @@
     if (reconnTimer) { clearTimeout(reconnTimer); reconnTimer = null; }
   }
 
-  function scheduleReconnect() {
+  function scheduleReconnect(cfg) {
     clearReconn();
-    reconnTimer = setTimeout(() => { if (!stopped) connect(); }, CFG.reconnectDelay);
+    reconnTimer = setTimeout(() => { if (!stopped) connect(); }, (cfg || getCfg()).reconnectDelay);
   }
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
   function shortUrl(url) {
+    if (!url) return '(未配置)';
     return url.replace(/^wss?:\/\//, '').replace(/\/.*$/, '');
   }
 
@@ -551,7 +591,8 @@
   }
 
   // ─── 自动启动 ─────────────────────────────────────────────────────────────
-  if (CFG.autoStart) {
+  const initCfg = getCfg();
+  if (initCfg.autoStart) {
     stopped = false;
     $btnStart.disabled = true;
     $btnStop.disabled  = false;
@@ -559,6 +600,7 @@
   } else {
     setDot('disconnected', '未连接');
     addLog('点击「▶ 启动」开始连接', 'info');
+    addLog(`当前配置：${initCfg.serverUrl}`, 'info');
   }
 
 })();
