@@ -112,10 +112,16 @@ curl -X POST http://localhost:8080/api/jobs \
 | `DASHBOARD_PASS` | `admin` | Dashboard 登录密码 |
 | `API_KEY` | _(空，不鉴权)_ | REST API 鉴权 Key；设置后所有 `/api/*` 请求须携带 `X-API-Key` header |
 | `DB_PATH` | `queue.db` | SQLite 数据库文件路径 |
+| `WS_JOB_TIMEOUT_SEC` | `300` | WS Worker 处理单个任务的最长等待时间（秒）。调用 AI API 等长耗时任务可设置更大的值，例如 `3600`（1 小时）。per-job 的 `timeout_sec` 字段优先级更高 |
+| `STALE_JOB_TIMEOUT_SEC` | `300` | Stale Job Reaper 判定任务卡死的阈值（秒）。建议 ≥ `WS_JOB_TIMEOUT_SEC`，否则任务还没超时就被 Reaper 放回 pending |
+| `DEFAULT_JOB_TIMEOUT_SEC` | `60` | 内置 GoWorker 单任务默认超时（秒）。per-job 的 `timeout_sec` 字段优先级更高 |
 
 ```bash
 # 生产环境示例
 DASHBOARD_USER=ops DASHBOARD_PASS=s3cr3t API_KEY=my-api-key ./goapp
+
+# AI API 场景：任务可能耗时数分钟，调大超时
+WS_JOB_TIMEOUT_SEC=3600 STALE_JOB_TIMEOUT_SEC=3600 ./goapp
 ```
 
 服务固定监听 `:8080`，支持优雅关闭（SIGINT / SIGTERM）。
@@ -145,7 +151,7 @@ X-API-Key: <your-api-key>
   "delay":        0,                // 延迟秒数（0 = 立即可用）
   "priority":     5,                // 优先级 1-10，数字越大越优先，默认 5
   "dedup_key":    "",               // 去重 Key，相同 key 的 pending 任务只保留一个
-  "timeout_sec":  60,               // 任务超时秒数（传给 Worker，默认 60）
+  "timeout_sec":  60,               // 任务超时秒数（传给 Worker，默认 60）。同时作为 WS Worker 等待该任务结果的超时上限
   "max_attempts": 3,                // 最大重试次数（传给 Worker）
   "backoff":      [10, 30, 60],     // 自定义重试延迟（秒），按次数依次使用
   "next_job":     { ... },          // 任务链：本任务完成后自动投递的下一个任务

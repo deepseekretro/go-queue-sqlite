@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -225,11 +226,48 @@ func reserve(queue string) (*Job, error) {
 }
 
 const (
-	MaxAttempts         = 3    // 最多尝试次数，超过后进死信队列
-	StaleJobTimeout     = 5 * 60 // 任务卡在 running 超过 5 分钟视为 stale
-	RetryBaseDelaySec   = 10  // 指数退避基础延迟（秒）
-	DefaultJobTimeoutSec = 60 // 单个任务默认执行超时（秒）
+	MaxAttempts       = 3  // 最多尝试次数，超过后进死信队列
+	RetryBaseDelaySec = 10 // 指数退避基础延迟（秒）
 )
+
+// 以下超时参数支持通过环境变量覆盖（在 initTimeouts() 中初始化）
+var (
+	// WsJobTimeoutSec：WS Worker 处理单个任务的最长等待时间（秒）
+	// 环境变量：WS_JOB_TIMEOUT_SEC，默认 300（5 分钟）
+	// 调用 AI API 等长耗时任务可设置更大的值，例如 3600（1 小时）
+	WsJobTimeoutSec = 300
+
+	// StaleJobTimeout：Stale Job Reaper 判定任务卡死的阈值（秒）
+	// 环境变量：STALE_JOB_TIMEOUT_SEC，默认 300（5 分钟）
+	// 应 >= WsJobTimeoutSec，否则任务还没超时就被 Reaper 放回 pending
+	StaleJobTimeout = 300
+
+	// DefaultJobTimeoutSec：内置 GoWorker 单任务默认超时（秒）
+	// 环境变量：DEFAULT_JOB_TIMEOUT_SEC，默认 60
+	// per-job 的 timeout_sec 字段优先级更高
+	DefaultJobTimeoutSec = 60
+)
+
+// initTimeouts 从环境变量读取超时配置，在 main() 最开始调用
+func initTimeouts() {
+	if v := os.Getenv("WS_JOB_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			WsJobTimeoutSec = n
+		}
+	}
+	if v := os.Getenv("STALE_JOB_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			StaleJobTimeout = n
+		}
+	}
+	if v := os.Getenv("DEFAULT_JOB_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			DefaultJobTimeoutSec = n
+		}
+	}
+	log.Printf("[Config] Timeouts — ws_job=%ds stale=%ds default_job=%ds",
+		WsJobTimeoutSec, StaleJobTimeout, DefaultJobTimeoutSec)
+}
 
 // workerWg 追踪所有正在执行的 GoWorker goroutine，优雅关闭时等待它们完成
 var workerWg sync.WaitGroup
@@ -292,11 +330,13 @@ func markFailed(j *Job, reason string) {
 // ─────────────────────────────────────────────
 
 type WsJobMessage struct {
-	Type    string `json:"type"`
-	JobID   int64  `json:"job_id"`
-	Queue   string `json:"queue"`
-	JobType string `json:"job_type"`
-	Payload string `json:"payload"`
+	Type       string   `json:"type"`
+	JobID      int64    `json:"job_id"`
+	Queue      string   `json:"queue"`
+	JobType    string   `json:"job_type"`
+	Payload    string   `json:"payload"`
+	Tags       []string `json:"tags,omitempty"`
+	TimeoutSec int      `json:"timeout_sec,omitempty"` // 任务超时秒数，Worker 可据此设置本地超时
 }
 
 type WsResultMessage struct {
@@ -321,6 +361,7 @@ type WsWorker struct {
 	kick         chan struct{} // 收到信号后主动断开连接（被踢）
 	currentJobID int64        // 当前正在处理的任务 ID，断连时用于放回 pending
 	idle         bool         // true = 空闲，可接受新任务
+	timeoutSec   int          // 当前任务的超时秒数（0 = 使用 WsJobTimeoutSec 全局默认）
 }
 
 type WorkerHub struct {
@@ -429,18 +470,32 @@ func (h *WorkerHub) dispatchToWs(j *Job) bool {
 		if w.queue != j.Queue && w.queue != "" {
 			continue
 		}
+		// 从 payload 解析 timeout_sec，用于 WS 等待超时
+		var pTimeout struct {
+			TimeoutSec int      `json:"timeout_sec"`
+			Tags       []string `json:"tags"`
+		}
+		_ = json.Unmarshal([]byte(j.Payload), &pTimeout)
+		jobTimeoutSec := pTimeout.TimeoutSec
+		if jobTimeoutSec <= 0 {
+			jobTimeoutSec = WsJobTimeoutSec // 使用全局默认
+		}
+
 		msg := WsJobMessage{
-			Type:    "job",
-			JobID:   j.ID,
-			Queue:   j.Queue,
-			JobType: j.JobType(),
-			Payload: j.Payload,
+			Type:       "job",
+			JobID:      j.ID,
+			Queue:      j.Queue,
+			JobType:    j.JobType(),
+			Payload:    j.Payload,
+			Tags:       pTimeout.Tags,
+			TimeoutSec: jobTimeoutSec,
 		}
 		b, _ := json.Marshal(msg)
 		select {
 		case w.send <- b:
 			w.idle = false          // 标记为忙碌
 			w.currentJobID = j.ID   // 记录当前任务
+			w.timeoutSec = jobTimeoutSec // 记录超时，供 WS handler 使用
 			h.rrIdx = (idx + 1) % n // 下次从下一个开始
 			return true
 		default:
@@ -609,13 +664,19 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 				rescheduleCurrentJob("write error")
 				return
 			}
-			log.Printf("[WS] Job sent to worker %s", workerID)
+			// 确定本次任务的等待超时：优先用 per-job timeout_sec，fallback 到全局 WsJobTimeoutSec
+			wsTimeout := worker.timeoutSec
+			if wsTimeout <= 0 {
+				wsTimeout = WsJobTimeoutSec
+			}
+			log.Printf("[WS] Job sent to worker %s (timeout=%ds)", workerID, wsTimeout)
 			select {
 			case result := <-worker.result:
 				// 处理完毕，标记 worker 为 idle
 				hub.mu.Lock()
 				worker.idle = true
 				worker.currentJobID = 0
+				worker.timeoutSec = 0
 				hub.mu.Unlock()
 				if result.Success {
 					markDone(result.JobID)
@@ -637,9 +698,9 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 				rescheduleCurrentJob("kicked by admin while processing")
 				log.Printf("[WS] Worker %s kicked by admin while processing", workerID)
 				return
-			case <-time.After(30 * time.Second):
-				rescheduleCurrentJob("30s timeout")
-				log.Printf("[WS] Worker %s timed out, disconnecting", workerID)
+			case <-time.After(time.Duration(wsTimeout) * time.Second):
+				rescheduleCurrentJob(fmt.Sprintf("%ds timeout", wsTimeout))
+				log.Printf("[WS] Worker %s timed out after %ds, disconnecting", workerID, wsTimeout)
 				return
 			case <-worker.done:
 				rescheduleCurrentJob("disconnected while processing")
@@ -660,7 +721,7 @@ func startStaleJobReaper() {
 	go func() {
 		for {
 			time.Sleep(30 * time.Second)
-			threshold := time.Now().Unix() - StaleJobTimeout
+			threshold := time.Now().Unix() - int64(StaleJobTimeout)
 			res, err := db.Exec(
 				`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=?
 				 WHERE status='running' AND updated_at<?`,
@@ -676,7 +737,7 @@ func startStaleJobReaper() {
 			}
 		}
 	}()
-	log.Printf("[Reaper] Started — stale threshold=%ds, scan interval=30s", StaleJobTimeout)
+	log.Printf("[Reaper] Started — stale threshold=%ds, scan interval=30s (env: STALE_JOB_TIMEOUT_SEC)", StaleJobTimeout)
 }
 
 // ─────────────────────────────────────────────
@@ -1223,6 +1284,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────
 
 func main() {
+	initTimeouts()
 	initLogger()
 	initDB()
 	initBatchDB()
