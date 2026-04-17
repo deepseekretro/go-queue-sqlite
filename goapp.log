@@ -1,0 +1,125 @@
+2026/04/17 06:59:38 [DB] SQLite (pure Go / modernc.org/sqlite) initialized ✓
+2026/04/17 06:59:38 [GoWorker] Started queue=default concurrency=2 (ws-ready)
+2026/04/17 06:59:38 [GoWorker] Started queue=emails concurrency=1 (ws-ready)
+2026/04/17 06:59:38 [WsDispatcher] Started for queue=default
+2026/04/17 06:59:38 [WsDispatcher] Started for queue=emails
+2026/04/17 06:59:38 [HTTP] Listening on :8080
+2026/04/17 06:59:46 [GoWorker] Processing job #22 type=send_email queue=default attempt=1
+2026/04/17 06:59:47 [GoWorker] Processing job #23 type=generate_report queue=default attempt=1
+2026/04/17 06:59:47 [GoWorker] ✉  Email sent to alice@example.com: Workflow Test
+2026/04/17 06:59:47 [GoWorker] job #22 done ✓
+2026/04/17 06:59:48 [GoWorker] Processing job #24 type=fail_job queue=default attempt=1
+2026/04/17 06:59:48 [GoWorker] job #24 failed: intentional failure for testing
+2026/04/17 06:59:49 [GoWorker] 📊 Report generated: workflow_report
+2026/04/17 06:59:49 [GoWorker] job #23 done ✓
+2026/04/17 07:00:00 [Hub] Worker registered: id=ws-1776409200624626693 queue=default total=1
+2026/04/17 07:00:03 [GoWorker] Processing job #25 type=resize_image queue=default attempt=1
+2026/04/17 07:00:03 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:03 [GoWorker] Processing job #27 type=resize_image queue=default attempt=1
+2026/04/17 07:00:04 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:05 [GoWorker] job #25 done ✓
+2026/04/17 07:00:05 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:05 [GoWorker] Processing job #31 type=resize_image queue=default attempt=1
+2026/04/17 07:00:06 [WS] Job #26 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:06 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:07 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:07 [GoWorker] job #27 done ✓
+2026/04/17 07:00:08 [GoWorker] Processing job #35 type=resize_image queue=default attempt=1
+2026/04/17 07:00:08 [GoWorker] job #31 done ✓
+2026/04/17 07:00:09 [WS] Job #28 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:09 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:09 [GoWorker] Processing job #36 type=resize_image queue=default attempt=1
+2026/04/17 07:00:09 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:10 [GoWorker] job #35 done ✓
+2026/04/17 07:00:10 [WS] Job #29 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:10 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:10 [GoWorker] Processing job #37 type=resize_image queue=default attempt=1
+2026/04/17 07:00:10 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:11 [GoWorker] job #36 done ✓
+2026/04/17 07:00:11 [GoWorker] Processing job #39 type=resize_image queue=default attempt=1
+2026/04/17 07:00:11 [WS] Job #30 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:11 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:12 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:12 [GoWorker] job #37 done ✓
+2026/04/17 07:00:12 [GoWorker] Processing job #41 type=resize_image queue=default attempt=1
+2026/04/17 07:00:13 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:13 [WS] Job #32 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:13 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:13 [GoWorker] job #39 done ✓
+2026/04/17 07:00:13 [GoWorker] Processing job #42 type=resize_image queue=default attempt=1
+2026/04/17 07:00:14 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:14 [GoWorker] job #41 done ✓
+2026/04/17 07:00:14 [GoWorker] Processing job #44 type=resize_image queue=default attempt=1
+2026/04/17 07:00:14 [WS] Job #33 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:14 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:14 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:15 [GoWorker] job #42 done ✓
+2026/04/17 07:00:15 [GoWorker] Processing job #45 type=resize_image queue=default attempt=1
+2026/04/17 07:00:15 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:16 [WS] Job #34 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:16 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:16 [GoWorker] job #44 done ✓
+2026/04/17 07:00:16 [GoWorker] Processing job #47 type=resize_image queue=default attempt=1
+2026/04/17 07:00:16 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:16 [GoWorker] job #45 done ✓
+2026/04/17 07:00:17 [GoWorker] Processing job #49 type=resize_image queue=default attempt=1
+2026/04/17 07:00:17 [WS] Job #38 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:17 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:18 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:18 [GoWorker] job #47 done ✓
+2026/04/17 07:00:18 [GoWorker] Processing job #51 type=resize_image queue=default attempt=1
+2026/04/17 07:00:18 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:18 [WS] Job #40 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:18 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:19 [GoWorker] job #49 done ✓
+2026/04/17 07:00:19 [GoWorker] Processing job #52 type=resize_image queue=default attempt=1
+2026/04/17 07:00:19 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:20 [GoWorker] job #51 done ✓
+2026/04/17 07:00:20 [WS] Job #43 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:20 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:20 [GoWorker] Processing job #54 type=resize_image queue=default attempt=1
+2026/04/17 07:00:20 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:21 [GoWorker] job #52 done ✓
+2026/04/17 07:00:21 [GoWorker] Processing job #56 type=resize_image queue=default attempt=1
+2026/04/17 07:00:21 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:22 [WS] Job #46 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:22 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:22 [GoWorker] job #54 done ✓
+2026/04/17 07:00:22 [GoWorker] 🖼  Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:22 [GoWorker] job #56 done ✓
+2026/04/17 07:00:23 [WS] Job #48 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:23 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:24 [WS] Job #50 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:24 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:26 [WS] Job #53 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:26 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:27 [WS] Job #55 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:27 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:28 [WS] Job #57 done by worker ws-1776409200624626693: Image resized: https://cdn.example.com/ws-test.jpg
+2026/04/17 07:00:58 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:00:59 [WS] Job #58 failed by worker ws-1776409200624626693: intentional failure from WS worker
+2026/04/17 07:01:17 [GoWorker] Processing job #59 type=send_email queue=default attempt=1
+2026/04/17 07:01:18 [GoWorker] Processing job #60 type=send_email queue=default attempt=1
+2026/04/17 07:01:18 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:01:18 [GoWorker] ✉  Email sent to user1@example.com: Batch email #1
+2026/04/17 07:01:18 [GoWorker] job #59 done ✓
+2026/04/17 07:01:19 [GoWorker] ✉  Email sent to user2@example.com: Batch email #2
+2026/04/17 07:01:19 [GoWorker] job #60 done ✓
+2026/04/17 07:01:20 [WS] Job #61 done by worker ws-1776409200624626693: Email sent to user3@example.com: Batch email #3
+2026/04/17 07:01:20 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:01:23 [WS] Job #62 done by worker ws-1776409200624626693: Email sent to user4@example.com: Batch email #4
+2026/04/17 07:01:23 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:01:23 [GoWorker] Processing job #64 type=send_email queue=default attempt=1
+2026/04/17 07:01:24 [GoWorker] ✉  Email sent to user6@example.com: Batch email #6
+2026/04/17 07:01:24 [WS] Job #63 done by worker ws-1776409200624626693: Email sent to user5@example.com: Batch email #5
+2026/04/17 07:01:24 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:01:24 [GoWorker] job #64 done ✓
+2026/04/17 07:01:24 [GoWorker] Processing job #66 type=send_email queue=default attempt=1
+2026/04/17 07:01:25 [GoWorker] ✉  Email sent to user8@example.com: Batch email #8
+2026/04/17 07:01:25 [WS] Job #65 done by worker ws-1776409200624626693: Email sent to user7@example.com: Batch email #7
+2026/04/17 07:01:26 [GoWorker] job #66 done ✓
+2026/04/17 07:01:26 [GoWorker] Processing job #67 type=send_email queue=default attempt=1
+2026/04/17 07:01:27 [WS] Job sent to worker ws-1776409200624626693
+2026/04/17 07:01:27 [GoWorker] ✉  Email sent to user9@example.com: Batch email #9
+2026/04/17 07:01:27 [GoWorker] job #67 done ✓
+2026/04/17 07:01:29 [WS] Job #68 done by worker ws-1776409200624626693: Email sent to user10@example.com: Batch email #10

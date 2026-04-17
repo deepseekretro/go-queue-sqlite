@@ -407,7 +407,7 @@ func startGoWorker(queue string, concurrency int) {
 			}()
 		}
 	}()
-	log.Printf("[GoWorker] Started queue=%s concurrency=%d (ws-ready)", queue, concurrency)
+	log.Printf("[GoWorker/fallback] Started queue=%s concurrency=%d", queue, concurrency)
 }
 
 // ─────────────────────────────────────────────
@@ -497,6 +497,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow(`SELECT COUNT(*) FROM failed_jobs`).Scan(&failed)
 	stats["failed_jobs_table"] = failed
 	stats["ws_workers"] = hub.count()
+	stats["queues"] = []string{"default", "emails"}
 	jsonResp(w, 200, stats)
 }
 
