@@ -129,15 +129,42 @@ func reserve(queue string) (*Job, error) {
 	return &j, nil
 }
 
+const (
+	MaxAttempts      = 3              // 最多尝试次数，超过后进死信队列
+	StaleJobTimeout  = 5 * 60        // 任务卡在 running 超过 5 分钟视为 stale
+	RetryBaseDelaySec = 10           // 指数退避基础延迟（秒）
+)
+
 func markDone(id int64) {
 	db.Exec(`UPDATE jobs SET status='done', updated_at=? WHERE id=?`, time.Now().Unix(), id)
 }
 
-func markFailed(j *Job, reason string) {
+// handleJobFailure：失败时先判断是否还有重试机会
+//   - attempts < MaxAttempts → 放回 pending，指数退避延迟
+//   - attempts >= MaxAttempts → 进死信队列（failed_jobs）
+func handleJobFailure(j *Job, reason string) {
 	now := time.Now().Unix()
-	db.Exec(`UPDATE jobs SET status='failed', updated_at=? WHERE id=?`, now, j.ID)
-	db.Exec(`INSERT INTO failed_jobs (queue, payload, exception, failed_at) VALUES (?,?,?,?)`,
-		j.Queue, j.Payload, reason, now)
+	if j.Attempts < MaxAttempts {
+		// 指数退避：第 N 次重试延迟 2^(N-1) * RetryBaseDelaySec 秒
+		delaySec := int64(1<<uint(j.Attempts-1)) * RetryBaseDelaySec
+		availAt := now + delaySec
+		db.Exec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE id=?`,
+			availAt, now, j.ID)
+		log.Printf("[Queue] Job #%d will retry (attempt %d/%d) in %ds — reason: %s",
+			j.ID, j.Attempts, MaxAttempts, delaySec, reason)
+	} else {
+		// 超过最大重试次数，进死信队列
+		jobType := j.JobType()
+		db.Exec(`UPDATE jobs SET status='failed', updated_at=? WHERE id=?`, now, j.ID)
+		db.Exec(`INSERT INTO failed_jobs (queue, job_type, payload, attempts, exception, failed_at) VALUES (?,?,?,?,?,?)`,
+			j.Queue, jobType, j.Payload, j.Attempts, reason, now)
+		log.Printf("[Queue] Job #%d → DLQ after %d attempts — reason: %s", j.ID, j.Attempts, reason)
+	}
+}
+
+// markFailed 保留作为直接进 DLQ 的快捷方式（payload 解析失败等不可重试的错误）
+func markFailed(j *Job, reason string) {
+	handleJobFailure(j, reason)
 }
 
 // ─────────────────────────────────────────────
@@ -397,6 +424,36 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 }
 
 // ─────────────────────────────────────────────
+// Stale Job Reaper
+// ─────────────────────────────────────────────
+
+// startStaleJobReaper 每 30s 扫描一次：
+// 把 status='running' 且超过 StaleJobTimeout 秒未更新的任务放回 pending
+// 这能恢复服务崩溃、WS 断连未处理等场景下卡住的任务
+func startStaleJobReaper() {
+	go func() {
+		for {
+			time.Sleep(30 * time.Second)
+			threshold := time.Now().Unix() - StaleJobTimeout
+			res, err := db.Exec(
+				`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=?
+				 WHERE status='running' AND updated_at<?`,
+				time.Now().Unix(), threshold,
+			)
+			if err != nil {
+				log.Printf("[Reaper] error: %v", err)
+				continue
+			}
+			n, _ := res.RowsAffected()
+			if n > 0 {
+				log.Printf("[Reaper] Rescued %d stale job(s) back to pending", n)
+			}
+		}
+	}()
+	log.Printf("[Reaper] Started — stale threshold=%ds, scan interval=30s", StaleJobTimeout)
+}
+
+// ─────────────────────────────────────────────
 // Fallback Go Worker
 // ─────────────────────────────────────────────
 
@@ -587,6 +644,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func main() {
 	initDB()
 
+	startStaleJobReaper()
 	startGoWorker("default", 2)
 	startGoWorker("emails", 1)
 	startWsDispatcher("default")
