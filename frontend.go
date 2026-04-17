@@ -292,13 +292,14 @@ const indexHTML = `<!DOCTYPE html>
 
 <script>
 // ─── WebSocket URL ───────────────────────────────────────────────────────────
-const WS_URL = 'wss://24f7f8fe-1114-4510-9f39-bdbd913f8772.deepnoteproject.com/ws/worker';
+// WS_URL 根据当前页面协议和 host 动态生成，无需硬编码
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/worker';
 
 // ─── Code examples ───────────────────────────────────────────────────────────
 const JS_CODE = ` + "`" + `// JavaScript WebSocket Worker 示例
-// 连接到: wss://24f7f8fe-1114-4510-9f39-bdbd913f8772.deepnoteproject.com/ws/worker?queue=default
+// 连接到: ws(s)://<your-server>/ws/worker?queue=default
 
-const WS_URL = 'wss://24f7f8fe-1114-4510-9f39-bdbd913f8772.deepnoteproject.com/ws/worker';
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/worker';
 
 function createWorker(queue = 'default', handlers = {}) {
   const ws = new WebSocket(\` + "`" + `\${WS_URL}?queue=\${queue}\` + "`" + `);
@@ -372,7 +373,7 @@ const PYTHON_CODE = ` + "`" + `# Python WebSocket Worker 示例
 
 import json, time, websocket
 
-WS_URL = 'wss://24f7f8fe-1114-4510-9f39-bdbd913f8772.deepnoteproject.com/ws/worker?queue=default'
+WS_URL = 'ws://localhost:8080/ws/worker?queue=default'  # 替换为你的服务器地址
 
 HANDLERS = {
     'send_email': lambda data: (
@@ -591,7 +592,7 @@ async function dispatchToWs(jobType) {
   const j = await res.json();
   if (res.ok) {
     toast(` + "`" + `✅ Job #${j.job_id} dispatched → [${queue}]` + "`" + `);
-    if (!wsRunning) wsLog('⚠ WS Worker 未连接，任务将由内置 Go Worker 处理', 'log-warn');
+    if (!wsRunning) wsLog('⚠ WS Worker 未连接，任务将在队列中等待 Worker 连接后处理', 'log-warn');
   }
 }
 
