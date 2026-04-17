@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         GoQueue Worker Panel
 // @namespace    https://github.com/deepseekretro/go-queue-sqlite
-// @version      4.0.0
-// @description  在页面右上角显示 GoQueue Worker 控制面板，实时展示连接状态与任务日志（v4: tags/batch catch-finally/cron/queue pause）
+// @version      4.1.0
+// @description  在页面右上角显示 GoQueue Worker 控制面板，实时展示连接状态与任务日志，支持直接投递任务（v4: tags/batch/cron/queue pause/enqueue）
 // @author       GoQueue
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -222,6 +224,53 @@
     #gq-config-actions {
       display: flex; gap: 6px; margin-top: 4px;
     }
+
+    /* 投递任务弹层 */
+    #gq-enqueue-modal {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: #0f172a;
+      z-index: 10;
+      padding: 14px 14px 10px;
+      flex-direction: column;
+      gap: 8px;
+      overflow-y: auto;
+    }
+    #gq-enqueue-modal.open { display: flex; }
+    #gq-enqueue-modal label {
+      font-size: 11px; color: #64748b; font-weight: 600;
+      letter-spacing: .04em; text-transform: uppercase;
+      margin-bottom: 2px; display: block;
+    }
+    #gq-enqueue-modal input,
+    #gq-enqueue-modal textarea {
+      width: 100%;
+      padding: 6px 9px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 12px;
+      outline: none;
+      box-sizing: border-box;
+      font-family: inherit;
+    }
+    #gq-enqueue-modal textarea {
+      resize: vertical;
+      min-height: 72px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    }
+    #gq-enqueue-modal input:focus,
+    #gq-enqueue-modal textarea:focus { border-color: #3b82f6; }
+    #gq-enqueue-actions {
+      display: flex; gap: 6px; margin-top: 4px;
+    }
+    .gq-btn-enqueue {
+      background: linear-gradient(135deg, #7c3aed, #6d28d9);
+      color: #fff;
+    }
+    .gq-btn-enqueue:hover { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
   `);
 
   // ─── 面板 HTML（不在模板字符串里调用 GM_getValue，避免沙箱时序问题）────────
@@ -241,9 +290,10 @@
         <span id="gq-fail-badge"  class="gq-badge gq-badge-red">✗ 0</span>
       </div>
       <div id="gq-controls">
-        <button class="gq-btn gq-btn-start"  id="gq-btn-start">▶ 启动</button>
-        <button class="gq-btn gq-btn-stop"   id="gq-btn-stop"  disabled>■ 停止</button>
-        <button class="gq-btn gq-btn-config" id="gq-btn-config">⚙ 配置</button>
+        <button class="gq-btn gq-btn-start"   id="gq-btn-start">▶ 启动</button>
+        <button class="gq-btn gq-btn-stop"    id="gq-btn-stop"  disabled>■ 停止</button>
+        <button class="gq-btn gq-btn-enqueue" id="gq-btn-enqueue">📤 投递</button>
+        <button class="gq-btn gq-btn-config"  id="gq-btn-config">⚙ 配置</button>
       </div>
       <div id="gq-info">
         队列：<span id="gq-info-queue">-</span> &nbsp;|&nbsp;
@@ -274,6 +324,38 @@
           <button class="gq-btn gq-btn-config" id="cfg-cancel" style="flex:1">取消</button>
         </div>
       </div>
+
+      <!-- 投递任务弹层 -->
+      <div id="gq-enqueue-modal">
+        <div>
+          <label>Job Type <span style="color:#f87171">*</span></label>
+          <input id="enq-job-type" type="text" placeholder="send_email">
+        </div>
+        <div>
+          <label>队列名</label>
+          <input id="enq-queue" type="text" placeholder="default">
+        </div>
+        <div>
+          <label>Payload（JSON）</label>
+          <textarea id="enq-payload" placeholder='{"key": "value"}'></textarea>
+        </div>
+        <div>
+          <label>Tags（逗号分隔，可选）</label>
+          <input id="enq-tags" type="text" placeholder="urgent, notify">
+        </div>
+        <div>
+          <label>Timeout（秒，可选，0=默认）</label>
+          <input id="enq-timeout" type="number" placeholder="0" min="0">
+        </div>
+        <div>
+          <label>延迟（秒，可选）</label>
+          <input id="enq-delay" type="number" placeholder="0" min="0">
+        </div>
+        <div id="gq-enqueue-actions">
+          <button class="gq-btn gq-btn-enqueue" id="enq-submit" style="flex:2">📤 投递</button>
+          <button class="gq-btn gq-btn-config"  id="enq-cancel" style="flex:1">取消</button>
+        </div>
+      </div>
     </div>
   `;
   document.body.appendChild(panel);
@@ -294,6 +376,14 @@
   const $cfgApiKey  = panel.querySelector('#cfg-apikey');
   const $infoQueue  = panel.querySelector('#gq-info-queue');
   const $infoServer = panel.querySelector('#gq-info-server');
+  const $btnEnqueue = panel.querySelector('#gq-btn-enqueue');
+  const $enqModal   = panel.querySelector('#gq-enqueue-modal');
+  const $enqJobType = panel.querySelector('#enq-job-type');
+  const $enqQueue   = panel.querySelector('#enq-queue');
+  const $enqPayload = panel.querySelector('#enq-payload');
+  const $enqTags    = panel.querySelector('#enq-tags');
+  const $enqTimeout = panel.querySelector('#enq-timeout');
+  const $enqDelay   = panel.querySelector('#enq-delay');
 
   // ─── 初始化：读取配置后填充 info 行（避免在 innerHTML 模板里调用 GM_getValue）
   function refreshInfoBar() {
@@ -344,6 +434,112 @@
     $modal.classList.remove('open');
     addLog(`配置已保存 → ${server}  queue=${queue}`, 'warn');
   });
+
+  // ─── 投递任务弹层 ─────────────────────────────────────────────────────────
+  $btnEnqueue.addEventListener('click', () => {
+    const cfg = getCfg();
+    if (!$enqQueue.value) $enqQueue.value = cfg.queue || DEFAULT_QUEUE;
+    $enqModal.classList.add('open');
+    $enqJobType.focus();
+  });
+
+  panel.querySelector('#enq-cancel').addEventListener('click', () => {
+    $enqModal.classList.remove('open');
+  });
+
+  panel.querySelector('#enq-submit').addEventListener('click', () => {
+    enqueueJob();
+  });
+
+  // 支持 Ctrl+Enter 快速投递
+  $enqPayload.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) enqueueJob();
+  });
+
+  function enqueueJob() {
+    const jobType    = $enqJobType.value.trim();
+    const queue      = $enqQueue.value.trim() || DEFAULT_QUEUE;
+    const payloadRaw = $enqPayload.value.trim() || '{}';
+    const tagsRaw    = $enqTags.value.trim();
+    const timeoutSec = parseInt($enqTimeout.value) || 0;
+    const delaySec   = parseInt($enqDelay.value)   || 0;
+
+    // 校验 job_type
+    if (!jobType) {
+      $enqJobType.style.borderColor = '#ef4444';
+      $enqJobType.focus();
+      addLog('Job Type 不能为空', 'error');
+      return;
+    }
+    $enqJobType.style.borderColor = '';
+
+    // 校验 payload JSON
+    let payloadObj;
+    try {
+      payloadObj = JSON.parse(payloadRaw);
+    } catch (e) {
+      $enqPayload.style.borderColor = '#ef4444';
+      $enqPayload.focus();
+      addLog(`Payload JSON 格式错误: ${e.message}`, 'error');
+      return;
+    }
+    $enqPayload.style.borderColor = '';
+
+    // 解析 tags
+    const tags = tagsRaw
+      ? tagsRaw.split(',').map(t => t.trim()).filter(Boolean)
+      : [];
+
+    // 构造请求体
+    const body = { queue, job_type: jobType, data: payloadObj };
+    if (tags.length)    body.tags        = tags;
+    if (timeoutSec > 0) body.timeout_sec = timeoutSec;
+    if (delaySec   > 0) body.delay       = delaySec;
+
+    // 推导 HTTP 地址（ws:// → http://，wss:// → https://）
+    const cfg = getCfg();
+    const httpBase = cfg.serverUrl
+      .replace(/^wss:\/\//, 'https://')
+      .replace(/^ws:\/\//, 'http://')
+      .replace(/\/ws\/worker$/, '');
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (cfg.apiKey) headers['X-API-Key'] = cfg.apiKey;
+
+    addLog(`投递中 → ${jobType} queue=${queue}${tags.length ? ' tags=' + JSON.stringify(tags) : ''}`, 'warn');
+
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: `${httpBase}/api/jobs`,
+      headers,
+      data: JSON.stringify(body),
+      onload(resp) {
+        try {
+          const res = JSON.parse(resp.responseText);
+          if (resp.status === 200 || resp.status === 201) {
+            addLog(`✅ 投递成功 job_id=${res.job_id} status=${res.status}`, 'success');
+            $enqModal.classList.remove('open');
+            // 清空 payload/tags/timeout/delay，保留 job_type 和 queue 方便连续投递
+            $enqPayload.value = '';
+            $enqTags.value    = '';
+            $enqTimeout.value = '';
+            $enqDelay.value   = '';
+          } else {
+            addLog(`❌ 投递失败 HTTP ${resp.status}: ${res.error || resp.responseText}`, 'error');
+          }
+        } catch (e) {
+          addLog(`❌ 响应解析失败: ${e.message}`, 'error');
+        }
+      },
+      onerror(err) {
+        addLog(`❌ 网络错误: ${JSON.stringify(err)}`, 'error');
+      },
+      ontimeout() {
+        addLog('❌ 请求超时', 'error');
+      },
+      timeout: 15000,
+    });
+  }
 
   // ─── 启动 / 停止按钮 ──────────────────────────────────────────────────────
   $btnStart.addEventListener('click', () => {

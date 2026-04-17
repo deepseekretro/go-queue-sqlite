@@ -189,6 +189,29 @@ curl -X DELETE http://localhost:8080/api/crons/1
 | `tag_task` | 按 tags 路由处理示例（v4） |
 | `on_success` / `on_failure` / `on_finally` | Batch 回调示例（v4） |
 
+### 在面板中直接投递任务（Enqueue）
+
+点击面板上的「📤 投递」按钮，弹出投递表单，无需 curl 即可直接向服务端提交任务：
+
+| 字段 | 说明 | 必填 |
+|---|---|---|
+| Job Type | 任务类型，如 `fetch_url` | ✅ |
+| 队列名 | 目标队列，默认 `default` | |
+| Payload（JSON） | 任务数据，必须是合法 JSON | |
+| Tags | 逗号分隔的标签，如 `urgent, notify` | |
+| Timeout（秒） | 任务超时秒数，0 = 使用服务端默认 | |
+| 延迟（秒） | 延迟执行秒数，0 = 立即执行 | |
+
+投递成功后日志区会显示 `✅ 投递成功 job_id=xxx`，表单自动清空 Payload/Tags 字段，
+保留 Job Type 和队列名方便连续投递。
+
+> 快捷键：在 Payload 输入框中按 **Ctrl+Enter**（Mac: ⌘+Enter）可快速投递。
+
+投递地址由 Worker 配置中的「服务端地址」自动推导：
+- `ws://host/ws/worker` → `http://host/api/jobs`
+- `wss://host/ws/worker` → `https://host/api/jobs`
+
+
 ### 任务超时（timeout_sec）
 
 投递任务时可指定 `timeout_sec`，服务端会将该值下发给 Worker，油猴脚本自动用 `Promise.race` 实现超时：
