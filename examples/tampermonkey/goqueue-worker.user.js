@@ -15,7 +15,7 @@
   'use strict';
 
   // ─── 配置读写（带明确默认值，避免 GM_getValue 沙箱返回空值）────────────────
-  const DEFAULT_SERVER = 'ws://localhost:8080/ws/worker';
+  const DEFAULT_SERVER = 'wss://24f7f8fe-1114-4510-9f39-bdbd913f8772.deepnoteproject.com/ws/worker';
   const DEFAULT_QUEUE  = 'default';
 
   function getCfg() {
