@@ -1,42 +1,379 @@
 // ==UserScript==
-// @name         GoQueue Dashboard Worker
+// @name         GoQueue Worker Panel
 // @namespace    https://github.com/deepseekretro/go-queue-sqlite
-// @version      1.0.0
-// @description  在任意网页中以油猴脚本身份运行 GoQueue WebSocket Worker，处理后台任务
+// @version      2.0.0
+// @description  在页面右上角显示 GoQueue Worker 控制面板，实时展示连接状态与任务日志
 // @author       GoQueue
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        GM_registerMenuCommand
-// @grant        GM_notification
+// @grant        GM_addStyle
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  // ─── 配置（可通过油猴菜单修改，持久化存储）────────────────────────────────
+  // ─── 持久化配置 ────────────────────────────────────────────────────────────
   const CFG = {
-    serverUrl:      GM_getValue('gq_server',   'ws://localhost:8080/ws/worker'),
-    queue:          GM_getValue('gq_queue',    'default'),
-    apiKey:         GM_getValue('gq_api_key',  ''),
-    pingInterval:   GM_getValue('gq_ping',     20000),   // 心跳间隔（ms）
-    reconnectDelay: GM_getValue('gq_reconnect',3000),    // 断线重连间隔（ms）
-    autoStart:      GM_getValue('gq_autostart',true),    // 页面加载后自动启动
-    notify:         GM_getValue('gq_notify',   false),   // 任务完成后桌面通知
+    get serverUrl()      { return GM_getValue('gq_server',    'ws://localhost:8080/ws/worker'); },
+    get queue()          { return GM_getValue('gq_queue',     'default'); },
+    get apiKey()         { return GM_getValue('gq_api_key',   ''); },
+    get pingInterval()   { return GM_getValue('gq_ping',      20000); },
+    get reconnectDelay() { return GM_getValue('gq_reconnect', 3000); },
+    get autoStart()      { return GM_getValue('gq_autostart', false); },
   };
 
   // ─── 状态 ─────────────────────────────────────────────────────────────────
-  let ws        = null;
-  let pingTimer = null;
-  let stopped   = !CFG.autoStart;
-  let jobCount  = 0;
+  let ws          = null;
+  let pingTimer   = null;
+  let stopped     = true;
+  let jobCount    = 0;
+  let failCount   = 0;
+  let reconnTimer = null;
+
+  // ─── 样式注入 ──────────────────────────────────────────────────────────────
+  GM_addStyle(`
+    #gq-panel {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      z-index: 2147483647;
+      width: 320px;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      color: #e2e8f0;
+      box-shadow: 0 8px 32px rgba(0,0,0,.55);
+      border-radius: 12px;
+      overflow: hidden;
+      border: 1px solid #334155;
+      user-select: none;
+    }
+    #gq-panel.gq-collapsed #gq-body { display: none; }
+    #gq-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      background: #1e293b;
+      cursor: pointer;
+      border-bottom: 1px solid #334155;
+    }
+    #gq-header:hover { background: #263348; }
+    #gq-logo { font-size: 16px; flex-shrink: 0; }
+    #gq-title { font-weight: 700; color: #60a5fa; flex: 1; letter-spacing: .02em; }
+    #gq-status-dot {
+      width: 9px; height: 9px;
+      border-radius: 50%;
+      background: #475569;
+      flex-shrink: 0;
+      transition: background .3s;
+      box-shadow: 0 0 0 0 transparent;
+    }
+    #gq-status-dot.connected    { background: #22c55e; box-shadow: 0 0 6px #22c55e88; }
+    #gq-status-dot.connecting   { background: #f59e0b; animation: gq-pulse .8s infinite; }
+    #gq-status-dot.working      { background: #3b82f6; box-shadow: 0 0 6px #3b82f688; animation: gq-pulse .6s infinite; }
+    #gq-status-dot.disconnected { background: #ef4444; }
+    @keyframes gq-pulse {
+      0%,100% { opacity: 1; } 50% { opacity: .4; }
+    }
+    #gq-collapse-btn {
+      background: none; border: none; color: #64748b;
+      cursor: pointer; font-size: 14px; padding: 0 2px;
+      line-height: 1; flex-shrink: 0;
+    }
+    #gq-collapse-btn:hover { color: #94a3b8; }
+    #gq-body { background: #0f172a; }
+
+    /* 状态栏 */
+    #gq-statusbar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 12px;
+      background: #1e293b;
+      border-bottom: 1px solid #1e293b;
+      font-size: 11px;
+      color: #94a3b8;
+    }
+    #gq-status-text { flex: 1; }
+    .gq-badge {
+      display: inline-flex; align-items: center; gap: 3px;
+      padding: 1px 7px; border-radius: 99px; font-size: 11px; font-weight: 600;
+    }
+    .gq-badge-green  { background: #14532d; color: #4ade80; }
+    .gq-badge-red    { background: #450a0a; color: #f87171; }
+
+    /* 控制按钮 */
+    #gq-controls {
+      display: flex;
+      gap: 6px;
+      padding: 10px 12px;
+      border-bottom: 1px solid #1e293b;
+    }
+    .gq-btn {
+      flex: 1;
+      padding: 6px 0;
+      border: none;
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+    }
+    .gq-btn:active { transform: scale(.96); }
+    .gq-btn:disabled { opacity: .4; cursor: not-allowed; }
+    .gq-btn-start  { background: #16a34a; color: #fff; }
+    .gq-btn-start:hover:not(:disabled)  { background: #15803d; }
+    .gq-btn-stop   { background: #dc2626; color: #fff; }
+    .gq-btn-stop:hover:not(:disabled)   { background: #b91c1c; }
+    .gq-btn-config { background: #334155; color: #cbd5e1; }
+    .gq-btn-config:hover:not(:disabled) { background: #475569; }
+
+    /* 信息行 */
+    #gq-info {
+      padding: 6px 12px 8px;
+      font-size: 11px;
+      color: #475569;
+      border-bottom: 1px solid #1e293b;
+      line-height: 1.6;
+    }
+    #gq-info span { color: #64748b; }
+
+    /* 日志区 */
+    #gq-log-header {
+      display: flex;
+      align-items: center;
+      padding: 6px 12px 4px;
+      font-size: 11px;
+      color: #475569;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+    #gq-log-clear {
+      margin-left: auto;
+      background: none; border: none;
+      color: #475569; font-size: 11px; cursor: pointer;
+      padding: 0;
+    }
+    #gq-log-clear:hover { color: #94a3b8; }
+    #gq-log {
+      height: 160px;
+      overflow-y: auto;
+      padding: 0 12px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    #gq-log::-webkit-scrollbar { width: 4px; }
+    #gq-log::-webkit-scrollbar-track { background: transparent; }
+    #gq-log::-webkit-scrollbar-thumb { background: #334155; border-radius: 2px; }
+    .gq-log-line {
+      display: flex;
+      gap: 6px;
+      font-size: 11px;
+      line-height: 1.5;
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    }
+    .gq-log-time { color: #334155; flex-shrink: 0; }
+    .gq-log-msg  { color: #94a3b8; word-break: break-all; }
+    .gq-log-msg.info    { color: #94a3b8; }
+    .gq-log-msg.success { color: #4ade80; }
+    .gq-log-msg.error   { color: #f87171; }
+    .gq-log-msg.warn    { color: #fbbf24; }
+    .gq-log-msg.job     { color: #60a5fa; }
+
+    /* 配置弹层 */
+    #gq-config-modal {
+      display: none;
+      position: absolute;
+      inset: 0;
+      background: #0f172a;
+      z-index: 10;
+      padding: 14px 14px 10px;
+      flex-direction: column;
+      gap: 8px;
+    }
+    #gq-config-modal.open { display: flex; }
+    #gq-config-modal label {
+      font-size: 11px; color: #64748b; font-weight: 600;
+      letter-spacing: .04em; text-transform: uppercase;
+      margin-bottom: 2px; display: block;
+    }
+    #gq-config-modal input {
+      width: 100%;
+      padding: 6px 9px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 12px;
+      outline: none;
+      box-sizing: border-box;
+    }
+    #gq-config-modal input:focus { border-color: #3b82f6; }
+    #gq-config-actions {
+      display: flex; gap: 6px; margin-top: 4px;
+    }
+  `);
+
+  // ─── 面板 HTML ─────────────────────────────────────────────────────────────
+  const panel = document.createElement('div');
+  panel.id = 'gq-panel';
+  panel.innerHTML = `
+    <div id="gq-header">
+      <span id="gq-logo">⚡</span>
+      <span id="gq-title">GoQueue Worker</span>
+      <span id="gq-status-dot" title="disconnected"></span>
+      <button id="gq-collapse-btn" title="折叠/展开">▾</button>
+    </div>
+    <div id="gq-body">
+      <div id="gq-statusbar">
+        <span id="gq-status-text">未连接</span>
+        <span id="gq-done-badge"  class="gq-badge gq-badge-green">✓ 0</span>
+        <span id="gq-fail-badge"  class="gq-badge gq-badge-red">✗ 0</span>
+      </div>
+      <div id="gq-controls">
+        <button class="gq-btn gq-btn-start"  id="gq-btn-start">▶ 启动</button>
+        <button class="gq-btn gq-btn-stop"   id="gq-btn-stop"  disabled>■ 停止</button>
+        <button class="gq-btn gq-btn-config" id="gq-btn-config">⚙ 配置</button>
+      </div>
+      <div id="gq-info">
+        队列：<span id="gq-info-queue">${CFG.queue}</span> &nbsp;|&nbsp;
+        服务端：<span id="gq-info-server">${shortUrl(CFG.serverUrl)}</span>
+      </div>
+      <div id="gq-log-header">
+        日志
+        <button id="gq-log-clear">清空</button>
+      </div>
+      <div id="gq-log"></div>
+
+      <!-- 配置弹层 -->
+      <div id="gq-config-modal">
+        <div>
+          <label>服务端地址</label>
+          <input id="cfg-server" type="text" placeholder="ws://localhost:8080/ws/worker">
+        </div>
+        <div>
+          <label>队列名</label>
+          <input id="cfg-queue" type="text" placeholder="default">
+        </div>
+        <div>
+          <label>API Key（留空表示不鉴权）</label>
+          <input id="cfg-apikey" type="text" placeholder="">
+        </div>
+        <div id="gq-config-actions">
+          <button class="gq-btn gq-btn-start" id="cfg-save" style="flex:2">保存</button>
+          <button class="gq-btn gq-btn-config" id="cfg-cancel" style="flex:1">取消</button>
+        </div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(panel);
+
+  // ─── DOM 引用 ──────────────────────────────────────────────────────────────
+  const $dot        = panel.querySelector('#gq-status-dot');
+  const $statusText = panel.querySelector('#gq-status-text');
+  const $doneBadge  = panel.querySelector('#gq-done-badge');
+  const $failBadge  = panel.querySelector('#gq-fail-badge');
+  const $log        = panel.querySelector('#gq-log');
+  const $btnStart   = panel.querySelector('#gq-btn-start');
+  const $btnStop    = panel.querySelector('#gq-btn-stop');
+  const $btnConfig  = panel.querySelector('#gq-btn-config');
+  const $collapseBtn= panel.querySelector('#gq-collapse-btn');
+  const $modal      = panel.querySelector('#gq-config-modal');
+  const $cfgServer  = panel.querySelector('#cfg-server');
+  const $cfgQueue   = panel.querySelector('#cfg-queue');
+  const $cfgApiKey  = panel.querySelector('#cfg-apikey');
+  const $infoQueue  = panel.querySelector('#gq-info-queue');
+  const $infoServer = panel.querySelector('#gq-info-server');
+
+  // ─── 折叠 ─────────────────────────────────────────────────────────────────
+  $collapseBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    panel.classList.toggle('gq-collapsed');
+    $collapseBtn.textContent = panel.classList.contains('gq-collapsed') ? '▸' : '▾';
+  });
+
+  // ─── 配置弹层 ─────────────────────────────────────────────────────────────
+  $btnConfig.addEventListener('click', () => {
+    $cfgServer.value = CFG.serverUrl;
+    $cfgQueue.value  = CFG.queue;
+    $cfgApiKey.value = CFG.apiKey;
+    $modal.classList.add('open');
+  });
+  panel.querySelector('#cfg-cancel').addEventListener('click', () => {
+    $modal.classList.remove('open');
+  });
+  panel.querySelector('#cfg-save').addEventListener('click', () => {
+    const server = $cfgServer.value.trim();
+    const queue  = $cfgQueue.value.trim() || 'default';
+    const apiKey = $cfgApiKey.value.trim();
+    if (!server) { $cfgServer.focus(); return; }
+    GM_setValue('gq_server',  server);
+    GM_setValue('gq_queue',   queue);
+    GM_setValue('gq_api_key', apiKey);
+    $infoQueue.textContent  = queue;
+    $infoServer.textContent = shortUrl(server);
+    $modal.classList.remove('open');
+    addLog('配置已保存，重新启动后生效', 'warn');
+  });
+
+  // ─── 启动 / 停止按钮 ──────────────────────────────────────────────────────
+  $btnStart.addEventListener('click', () => {
+    if (!stopped) return;
+    stopped = false;
+    $btnStart.disabled = true;
+    $btnStop.disabled  = false;
+    connect();
+  });
+  $btnStop.addEventListener('click', () => {
+    stopped = true;
+    clearPing();
+    clearReconn();
+    if (ws) { ws.close(); ws = null; }
+    $btnStart.disabled = false;
+    $btnStop.disabled  = true;
+    setDot('disconnected', '已停止');
+    addLog('Worker 已停止', 'warn');
+  });
+
+  // ─── 日志清空 ─────────────────────────────────────────────────────────────
+  panel.querySelector('#gq-log-clear').addEventListener('click', () => {
+    $log.innerHTML = '';
+  });
+
+  // ─── 日志工具 ─────────────────────────────────────────────────────────────
+  function addLog(msg, level = 'info') {
+    const now  = new Date();
+    const time = now.toTimeString().slice(0, 8);
+    const line = document.createElement('div');
+    line.className = 'gq-log-line';
+    line.innerHTML = `<span class="gq-log-time">${time}</span><span class="gq-log-msg ${level}">${escHtml(msg)}</span>`;
+    $log.appendChild(line);
+    // 最多保留 200 条
+    while ($log.children.length > 200) $log.removeChild($log.firstChild);
+    $log.scrollTop = $log.scrollHeight;
+  }
+
+  function setDot(state, text) {
+    $dot.className = '';
+    $dot.classList.add(state);
+    $dot.title = text;
+    $statusText.textContent = text;
+  }
+
+  function updateBadges() {
+    $doneBadge.textContent = `✓ ${jobCount}`;
+    $failBadge.textContent = `✗ ${failCount}`;
+  }
 
   // ─── Job Handlers ─────────────────────────────────────────────────────────
   // 在此注册你的任务处理函数：job_type → async function(data) → string
   const handlers = {
     /**
-     * 示例：抓取网页内容
+     * 抓取网页内容（利用浏览器 fetch，可绕过部分跨域限制）
      * 投递：{"queue":"default","job_type":"fetch_url","data":{"url":"https://example.com"}}
      */
     fetch_url: async (data) => {
@@ -46,7 +383,7 @@
     },
 
     /**
-     * 示例：延迟执行（模拟耗时任务）
+     * 延迟执行（模拟耗时任务）
      * 投递：{"queue":"default","job_type":"delay","data":{"ms":1000,"message":"hello"}}
      */
     delay: async (data) => {
@@ -55,16 +392,16 @@
     },
 
     /**
-     * 示例：localStorage 操作
+     * 写入 localStorage
      * 投递：{"queue":"default","job_type":"local_storage_set","data":{"key":"foo","value":"bar"}}
      */
     local_storage_set: async (data) => {
       localStorage.setItem(data.key, data.value);
-      return `localStorage.setItem(${data.key}, ${data.value})`;
+      return `localStorage[${data.key}] = ${data.value}`;
     },
 
     /**
-     * 示例：点击页面元素
+     * 点击页面元素
      * 投递：{"queue":"default","job_type":"click_element","data":{"selector":"#submit-btn"}}
      */
     click_element: async (data) => {
@@ -79,21 +416,21 @@
 
   function connect() {
     if (stopped) return;
-
     const url = `${CFG.serverUrl}?queue=${CFG.queue}`;
-    log(`Connecting to ${url}`);
+    setDot('connecting', '连接中...');
+    addLog(`连接 ${url}`, 'info');
 
     try {
       ws = new WebSocket(url);
     } catch (e) {
-      log(`WebSocket init failed: ${e.message}`, 'error');
+      addLog(`WebSocket 初始化失败: ${e.message}`, 'error');
       scheduleReconnect();
       return;
     }
 
     ws.onopen = () => {
-      log(`Connected ✓  queue=${CFG.queue}`);
-      updateBadge('🟢');
+      setDot('connected', `已连接 · ${CFG.queue}`);
+      addLog(`已连接，队列=${CFG.queue}`, 'success');
 
       // 心跳：每 20s 发一次 JSON ping，防止连接被中间代理超时断开
       pingTimer = setInterval(() => {
@@ -109,35 +446,33 @@
 
       switch (msg.type) {
         case 'connected':
-          log(`Server: ${msg.message}`);
+          addLog(`Server: ${msg.message}`, 'info');
           break;
-
         case 'pong':
           // 心跳响应，静默处理
           break;
-
         case 'ack':
-          log(`ACK: ${msg.message}`);
+          addLog(`ACK: ${msg.message}`, 'info');
           break;
-
         case 'job':
           await handleJob(msg);
           break;
-
         default:
-          log(`Unknown type: ${msg.type}`);
+          addLog(`未知消息类型: ${msg.type}`, 'warn');
       }
     };
 
     ws.onclose = () => {
-      log('Disconnected');
-      updateBadge('🔴');
       clearPing();
-      if (!stopped) scheduleReconnect();
+      if (!stopped) {
+        setDot('disconnected', '已断开，重连中...');
+        addLog('连接断开，等待重连...', 'warn');
+        scheduleReconnect();
+      }
     };
 
-    ws.onerror = (e) => {
-      log(`WebSocket error: ${e.message || 'unknown'}`, 'error');
+    ws.onerror = () => {
+      addLog('WebSocket 连接错误', 'error');
     };
   }
 
@@ -153,28 +488,31 @@
       return sendResult(jobId, false, '', `Invalid payload: ${e.message}`);
     }
 
-    log(`Job #${jobId} type=${jobType}`);
-    jobCount++;
-    updateBadge('🟡');
+    addLog(`Job #${jobId} [${jobType}]`, 'job');
+    setDot('working', `处理中 #${jobId}`);
 
     const handler = handlers[jobType];
     if (!handler) {
-      updateBadge('🟢');
+      failCount++;
+      updateBadges();
+      setDot('connected', `已连接 · ${CFG.queue}`);
+      addLog(`无 handler: "${jobType}"`, 'error');
       return sendResult(jobId, false, '', `No handler for job_type: "${jobType}"`);
     }
 
     try {
       const result = await handler(data);
-      log(`Job #${jobId} ✓ ${result}`);
+      jobCount++;
+      updateBadges();
+      setDot('connected', `已连接 · ${CFG.queue}`);
+      addLog(`#${jobId} ✓ ${result}`, 'success');
       sendResult(jobId, true, result, '');
-      if (CFG.notify) {
-        GM_notification({ title: 'GoQueue', text: `Job #${jobId} done: ${result}`, timeout: 3000 });
-      }
     } catch (err) {
-      log(`Job #${jobId} ✗ ${err.message}`, 'error');
+      failCount++;
+      updateBadges();
+      setDot('connected', `已连接 · ${CFG.queue}`);
+      addLog(`#${jobId} ✗ ${err.message}`, 'error');
       sendResult(jobId, false, '', err.message);
-    } finally {
-      updateBadge('🟢');
     }
   }
 
@@ -190,81 +528,37 @@
     if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
   }
 
+  function clearReconn() {
+    if (reconnTimer) { clearTimeout(reconnTimer); reconnTimer = null; }
+  }
+
   function scheduleReconnect() {
-    log(`Reconnecting in ${CFG.reconnectDelay}ms...`);
-    setTimeout(connect, CFG.reconnectDelay);
+    clearReconn();
+    reconnTimer = setTimeout(() => { if (!stopped) connect(); }, CFG.reconnectDelay);
   }
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  // ─── 日志 & UI ────────────────────────────────────────────────────────────
-
-  function log(msg, level = 'info') {
-    const prefix = '[GoQueue Worker]';
-    if (level === 'error') console.error(prefix, msg);
-    else                   console.log(prefix, msg);
+  function shortUrl(url) {
+    return url.replace(/^wss?:\/\//, '').replace(/\/.*$/, '');
   }
 
-  // 在页面标题前显示状态 emoji
-  const origTitle = document.title;
-  function updateBadge(emoji) {
-    document.title = `${emoji} ${origTitle}`;
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
   }
-
-  // ─── 油猴菜单命令 ─────────────────────────────────────────────────────────
-
-  GM_registerMenuCommand('⚙️ 配置 GoQueue Worker', () => {
-    const server = prompt('服务端 WebSocket 地址：', CFG.serverUrl);
-    if (server === null) return;
-    const queue  = prompt('队列名：', CFG.queue);
-    if (queue  === null) return;
-    const apiKey = prompt('API Key（留空表示不鉴权）：', CFG.apiKey);
-    if (apiKey === null) return;
-
-    GM_setValue('gq_server',  server);
-    GM_setValue('gq_queue',   queue);
-    GM_setValue('gq_api_key', apiKey);
-
-    CFG.serverUrl = server;
-    CFG.queue     = queue;
-    CFG.apiKey    = apiKey;
-
-    alert('配置已保存，刷新页面生效。');
-  });
-
-  GM_registerMenuCommand('▶️ 启动 Worker', () => {
-    if (!stopped) { alert('Worker 已在运行中。'); return; }
-    stopped = false;
-    connect();
-  });
-
-  GM_registerMenuCommand('⏹ 停止 Worker', () => {
-    stopped = true;
-    clearPing();
-    if (ws) { ws.close(); ws = null; }
-    updateBadge('⏹');
-    log('Worker stopped by user.');
-  });
-
-  GM_registerMenuCommand('📊 查看状态', () => {
-    const state = ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][ws.readyState] : 'NOT_CONNECTED';
-    alert(
-      `GoQueue Worker 状态\n` +
-      `─────────────────────\n` +
-      `服务端：${CFG.serverUrl}\n` +
-      `队列：${CFG.queue}\n` +
-      `连接状态：${state}\n` +
-      `已处理任务：${jobCount}`
-    );
-  });
 
   // ─── 自动启动 ─────────────────────────────────────────────────────────────
   if (CFG.autoStart) {
-    log(`Auto-starting worker (queue=${CFG.queue})...`);
+    stopped = false;
+    $btnStart.disabled = true;
+    $btnStop.disabled  = false;
     connect();
   } else {
-    log('Auto-start disabled. Use Tampermonkey menu → ▶️ 启动 Worker');
-    updateBadge('⏹');
+    setDot('disconnected', '未连接');
+    addLog('点击「▶ 启动」开始连接', 'info');
   }
 
 })();
