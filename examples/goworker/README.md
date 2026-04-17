@@ -116,6 +116,32 @@ curl -X PUT http://localhost:8080/api/crons/1 \
 curl -X DELETE http://localhost:8080/api/crons/1
 ```
 
+### 任务超时（timeout_sec）
+
+投递任务时可指定 `timeout_sec`，服务端会将该值下发给 Worker，Worker 自动应用超时控制：
+
+```bash
+# 投递一个最长允许 10 分钟的任务（适合 AI API 调用等长耗时场景）
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"queue":"default","job_type":"ai_task","data":{"prompt":"..."},"timeout_sec":600}'
+```
+
+超时优先级（从高到低）：
+
+| 优先级 | 方式 | 说明 |
+|---|---|---|
+| 1（最高） | per-job `timeout_sec` 字段 | 投递任务时指定，只影响该任务 |
+| 2 | `WS_JOB_TIMEOUT_SEC` 环境变量 | 启动服务时设置，影响所有任务，默认 300s |
+| 3（最低） | 代码默认值 | 300s（5 分钟） |
+
+```bash
+# 服务端全局超时（AI API 场景，设置为 1 小时）
+WS_JOB_TIMEOUT_SEC=3600 STALE_JOB_TIMEOUT_SEC=3600 ./goapp
+```
+
+Worker 侧（Go）：`handleJob` 会自动从 `msg.TimeoutSec` 读取超时，无需额外代码。
+
 ## 内置 Handler 列表
 
 | job_type | 说明 |

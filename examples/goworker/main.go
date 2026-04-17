@@ -41,14 +41,15 @@ import (
 
 // WsMessage 是服务端下发的消息
 type WsMessage struct {
-	Type    string          `json:"type"`
-	JobID   int64           `json:"job_id,omitempty"`
-	Queue   string          `json:"queue,omitempty"`
-	JobType string          `json:"job_type,omitempty"`
-	Payload string          `json:"payload,omitempty"`
-	Tags    []string        `json:"tags,omitempty"`   // v4: 任务标签
-	Message string          `json:"message,omitempty"`
-	Error   string          `json:"error,omitempty"`
+	Type       string   `json:"type"`
+	JobID      int64    `json:"job_id,omitempty"`
+	Queue      string   `json:"queue,omitempty"`
+	JobType    string   `json:"job_type,omitempty"`
+	Payload    string   `json:"payload,omitempty"`
+	Tags       []string `json:"tags,omitempty"`        // v4: 任务标签
+	TimeoutSec int      `json:"timeout_sec,omitempty"` // v4: 任务超时秒数（0 = 使用本地默认）
+	Message    string   `json:"message,omitempty"`
+	Error      string   `json:"error,omitempty"`
 }
 
 // ResultMessage 是 Worker 上报的结果
@@ -206,8 +207,12 @@ func handleJob(conn *websocket.Conn, msg WsMessage) {
 		return
 	}
 
-	// 执行（带超时）
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 执行（带超时）：优先用服务端下发的 timeout_sec，fallback 到 5 分钟
+	timeoutSec := msg.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = 5 * 60 // 默认 5 分钟
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
 	result, err := h(ctx, data, msg.Tags)

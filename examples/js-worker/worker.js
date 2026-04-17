@@ -157,8 +157,8 @@ function connect() {
 }
 
 async function handleJob(msg) {
-  const { job_id, job_type, queue, payload, tags = [] } = msg;
-  console.log(`[Job #${job_id}] type=${job_type} queue=${queue} tags=${JSON.stringify(tags)}`);
+  const { job_id, job_type, queue, payload, tags = [], timeout_sec = 0 } = msg;
+  console.log(`[Job #${job_id}] type=${job_type} queue=${queue} tags=${JSON.stringify(tags)} timeout=${timeout_sec || 300}s`);
 
   let data;
   try { data = JSON.parse(payload); } catch (e) {
@@ -173,8 +173,14 @@ async function handleJob(msg) {
     return;
   }
 
+  // 超时控制：优先用服务端下发的 timeout_sec，fallback 到 300s（5 分钟）
+  const timeoutMs = (timeout_sec > 0 ? timeout_sec : 300) * 1000;
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`job timed out after ${timeoutMs / 1000}s`)), timeoutMs)
+  );
+
   try {
-    const result = await handler(data, tags);
+    const result = await Promise.race([handler(data, tags), timeoutPromise]);
     console.log(`[Job #${job_id}] OK: ${result}`);
     sendResult(job_id, true, result, null);
   } catch (err) {

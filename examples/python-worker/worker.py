@@ -14,8 +14,10 @@ GoQueue Python Worker 示例
   - tags：任务可携带标签，handler 第二参数接收 tags 列表
   - batch catch/finally：批次失败/完成回调
   - queue pause/resume：队列可暂停，暂停期间任务不派发
+  - timeout_sec：服务端下发任务超时秒数，Worker 自动应用；per-job 优先级最高
 """
 
+import concurrent.futures
 import json
 import logging
 import os
@@ -122,13 +124,14 @@ class GoQueueWorker:
 
     def _handle_job(self, ws, msg: dict):
         try:
-            job_id   = msg["job_id"]
-            job_type = msg.get("job_type", "")
-            queue    = msg.get("queue", "")
-            payload  = msg.get("payload", "{}")
-            tags     = msg.get("tags") or []   # v4: 任务标签
+            job_id      = msg["job_id"]
+            job_type    = msg.get("job_type", "")
+            queue       = msg.get("queue", "")
+            payload     = msg.get("payload", "{}")
+            tags        = msg.get("tags") or []   # v4: 任务标签
+            timeout_sec = msg.get("timeout_sec") or 300  # v4: 超时秒数，fallback 300s
 
-            log.info(f"[Job #{job_id}] type={job_type} queue={queue} tags={tags}")
+            log.info(f"[Job #{job_id}] type={job_type} queue={queue} tags={tags} timeout={timeout_sec}s")
 
             # 解析 payload
             try:
@@ -144,8 +147,15 @@ class GoQueueWorker:
                 self._send_result(ws, job_id, False, error=f"no handler for job_type: {job_type}")
                 return
 
-            # 执行
-            result = handler(data, tags)
+            # 执行（带超时）：用 ThreadPoolExecutor + future.result(timeout) 实现
+            # timeout_sec 由服务端下发，优先级：per-job timeout_sec > 全局默认 300s
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(handler, data, tags)
+                try:
+                    result = future.result(timeout=timeout_sec)
+                except concurrent.futures.TimeoutError:
+                    raise TimeoutError(f"job timed out after {timeout_sec}s")
+
             log.info(f"[Job #{job_id}] OK: {result}")
             self._send_result(ws, job_id, True, log_msg=result)
 

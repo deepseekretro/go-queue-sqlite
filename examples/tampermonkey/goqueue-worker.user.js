@@ -547,10 +547,11 @@
   }
 
   async function handleJob(msg) {
-    const jobId   = msg.job_id;
-    const jobType = msg.job_type;
-    const tags    = msg.tags || [];   // v4: 任务标签
-    const cfg     = getCfg();
+    const jobId      = msg.job_id;
+    const jobType    = msg.job_type;
+    const tags       = msg.tags || [];          // v4: 任务标签
+    const timeoutSec = msg.timeout_sec || 300;  // v4: 超时秒数，fallback 300s
+    const cfg        = getCfg();
 
     let payload, data;
     try {
@@ -560,7 +561,7 @@
       return sendResult(jobId, false, '', `Invalid payload: ${e.message}`);
     }
 
-    addLog(`Job #${jobId} [${jobType}]${tags.length ? ' tags=' + JSON.stringify(tags) : ''}`, 'job');
+    addLog(`Job #${jobId} [${jobType}]${tags.length ? ' tags=' + JSON.stringify(tags) : ''} timeout=${timeoutSec}s`, 'job');
     setDot('working', `处理中 #${jobId}`);
 
     const handler = handlers[jobType];
@@ -572,8 +573,13 @@
       return sendResult(jobId, false, '', `No handler for job_type: "${jobType}"`);
     }
 
+    // 超时控制：优先用服务端下发的 timeout_sec，fallback 到 300s（5 分钟）
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`job timed out after ${timeoutSec}s`)), timeoutSec * 1000)
+    );
+
     try {
-      const result = await handler(data, tags);   // v4: 传递 tags
+      const result = await Promise.race([handler(data, tags), timeoutPromise]);   // v4: 传递 tags
       jobCount++;
       updateBadges();
       setDot('connected', `已连接 · ${cfg.queue}`);

@@ -188,3 +188,24 @@ curl -X DELETE http://localhost:8080/api/crons/1
 | `click_element` | 点击页面元素 |
 | `tag_task` | 按 tags 路由处理示例（v4） |
 | `on_success` / `on_failure` / `on_finally` | Batch 回调示例（v4） |
+
+### 任务超时（timeout_sec）
+
+投递任务时可指定 `timeout_sec`，服务端会将该值下发给 Worker，油猴脚本自动用 `Promise.race` 实现超时：
+
+```bash
+# 投递一个最长允许 10 分钟的任务
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"queue":"default","job_type":"fetch_url","data":{"url":"..."},"timeout_sec":600}'
+```
+
+超时优先级（从高到低）：
+
+| 优先级 | 方式 | 说明 |
+|---|---|---|
+| 1（最高） | per-job `timeout_sec` 字段 | 投递任务时指定，只影响该任务 |
+| 2 | `WS_JOB_TIMEOUT_SEC` 环境变量 | 启动服务时设置，影响所有任务，默认 300s |
+| 3（最低） | 代码默认值 | 300s（5 分钟） |
+
+Worker 侧（油猴）：`handleJob` 会自动从 `msg.timeout_sec` 读取超时，无需额外代码。
