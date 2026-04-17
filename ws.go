@@ -83,8 +83,12 @@ func (c *wsConn) ReadMessage() (int, []byte, error) {
 		}
 	}
 
-	if opcode == 8 {
+	switch opcode {
+	case 8: // Close
 		return opcode, nil, fmt.Errorf("websocket: connection closed by client")
+	case 9: // Ping → 自动回复 Pong（opcode=10），RFC 6455 §5.5.3
+		_ = c.WritePong(payload)
+		return c.ReadMessage() // 继续读下一帧
 	}
 	return opcode, payload, nil
 }
@@ -107,6 +111,11 @@ func (c *wsConn) WriteMessage(opcode int, data []byte) error {
 	frame := append(header, data...)
 	_, err := c.conn.Write(frame)
 	return err
+}
+
+// WritePong 发送 Pong 帧（opcode=10），响应客户端 Ping
+func (c *wsConn) WritePong(data []byte) error {
+	return c.WriteMessage(10, data)
 }
 
 func (c *wsConn) Close() error {

@@ -542,13 +542,20 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	})
 	conn.WriteMessage(1, welcome)
 
-	// read goroutine
+	// read goroutine：处理 result / ping 心跳消息
 	go func() {
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
 				close(worker.done)
 				return
+			}
+			// 心跳 ping：回复 pong
+			var ctrl WsControl
+			if json.Unmarshal(msg, &ctrl) == nil && ctrl.Type == "ping" {
+				pong, _ := json.Marshal(WsControl{Type: "pong", Message: "pong"})
+				conn.WriteMessage(1, pong)
+				continue
 			}
 			var result WsResultMessage
 			if err := json.Unmarshal(msg, &result); err != nil {

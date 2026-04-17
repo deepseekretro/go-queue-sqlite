@@ -337,7 +337,13 @@ const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.
 function createWorker(queue = 'default', handlers = {}) {
   const ws = new WebSocket(\` + "`" + `\${WS_URL}?queue=\${queue}\` + "`" + `);
 
-  ws.onopen = () => console.log('[Worker] Connected, queue=' + queue);
+  ws.onopen = () => {
+    console.log('[Worker] Connected, queue=' + queue);
+    // 心跳：每 20s 发一次 ping
+    ws._pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+    }, 20000);
+  };
 
   ws.onmessage = async (event) => {
     const msg = JSON.parse(event.data);
@@ -346,6 +352,8 @@ function createWorker(queue = 'default', handlers = {}) {
       console.log('[Worker] ' + msg.message);
       return;
     }
+
+    if (msg.type === 'pong') { return; } // 心跳 pong，静默
 
     if (msg.type === 'job') {
       console.log(\` + "`" + `[Worker] Received job #\${msg.job_id} type=\${msg.job_type}\` + "`" + `);
@@ -375,7 +383,10 @@ function createWorker(queue = 'default', handlers = {}) {
     }
   };
 
-  ws.onclose = () => console.log('[Worker] Disconnected');
+  ws.onclose = () => {
+    console.log('[Worker] Disconnected');
+    if (ws._pingInterval) clearInterval(ws._pingInterval);
+  };
   ws.onerror = (e) => console.error('[Worker] Error', e);
   return ws;
 }
@@ -488,6 +499,7 @@ function switchCodeTab(lang) {
 // ─── WebSocket Worker (in-browser demo) ──────────────────────────────────────
 let ws = null;
 let wsRunning = false;
+let wsPingInterval = null; // 心跳定时器
 
 function wsLog(msg, cls = 'log-info') {
   const box = document.getElementById('ws-log');
@@ -536,6 +548,12 @@ function startWorker() {
     wsLog('WebSocket 连接成功 ✓', 'log-ok');
     document.getElementById('ws-connect-btn').textContent = '⏹ 停止 WS Worker';
     document.getElementById('ws-connect-btn').className = 'btn btn-danger';
+    // 心跳：每 20s 发一次 ping，防止连接被中间代理/服务端超时断开
+    wsPingInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 20000);
   };
 
   ws.onmessage = async (event) => {
@@ -549,6 +567,11 @@ function startWorker() {
 
     if (msg.type === 'ack') {
       wsLog(` + "`" + `[Server] ${msg.message}` + "`" + `, 'log-ok');
+      return;
+    }
+
+    if (msg.type === 'pong') {
+      // 心跳 pong 回复，静默处理（不打印日志，避免刷屏）
       return;
     }
 
@@ -594,6 +617,7 @@ function startWorker() {
 }
 
 function stopWorker() {
+  if (wsPingInterval) { clearInterval(wsPingInterval); wsPingInterval = null; }
   if (ws) { ws.close(); ws = null; }
   wsRunning = false;
 }
