@@ -497,6 +497,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow(`SELECT COUNT(*) FROM failed_jobs`).Scan(&failed)
 	stats["failed_jobs_table"] = failed
 	stats["ws_workers"] = hub.count()
+	stats["version"] = "1.0.0"
 	stats["queues"] = []string{"default", "emails"}
 	jsonResp(w, 200, stats)
 }

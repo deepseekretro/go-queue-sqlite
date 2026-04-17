@@ -123,3 +123,4 @@
 2026/04/17 07:01:27 [GoWorker] ✉  Email sent to user9@example.com: Batch email #9
 2026/04/17 07:01:27 [GoWorker] job #67 done ✓
 2026/04/17 07:01:29 [WS] Job #68 done by worker ws-1776409200624626693: Email sent to user10@example.com: Batch email #10
+2026/04/17 07:03:47 [HTTP] Shutting down...
