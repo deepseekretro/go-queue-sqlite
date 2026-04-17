@@ -407,7 +407,7 @@ func startGoWorker(queue string, concurrency int) {
 			}()
 		}
 	}()
-	log.Printf("[GoWorker] Started queue=%s concurrency=%d", queue, concurrency)
+	log.Printf("[GoWorker] Started queue=%s concurrency=%d (ws-ready)", queue, concurrency)
 }
 
 // ─────────────────────────────────────────────
