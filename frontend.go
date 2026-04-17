@@ -727,8 +727,21 @@ async function clearFailed() {
 
 function loadAll() { loadStats(); loadJobs(); }
 
+// SSE 实时推送：stats 变化时自动刷新，无需轮询
+(function initSSE() {
+  const es = new EventSource('/api/events');
+  es.onmessage = (e) => {
+    if (e.data === 'refresh') loadAll();
+  };
+  es.onerror = () => {
+    // SSE 断开后 5s 重连，同时保底轮询
+    setTimeout(initSSE, 5000);
+  };
+  // 保底：每 30s 刷新一次（防止 SSE 静默失效）
+  setInterval(loadAll, 30000);
+})();
+
 loadAll();
-setInterval(loadAll, 2000);
 </script>
 </body>
 </html>

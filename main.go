@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +23,32 @@ import (
 
 var db *sql.DB
 
+// initLogger 根据环境变量 LOG_FORMAT 决定日志格式
+// LOG_FORMAT=json  → JSON 结构化日志（生产推荐）
+// LOG_FORMAT=text  → 人类可读文本（默认，开发友好）
+func initLogger() {
+	format := os.Getenv("LOG_FORMAT")
+	var handler slog.Handler
+	if format == "json" {
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	}
+	slog.SetDefault(slog.New(handler))
+	// 同时把标准 log 包重定向到 slog，兼容旧代码里的 log.Printf
+	log.SetFlags(0)
+	log.SetOutput(slogWriter{})
+}
+
+// slogWriter 把 log.Printf 的输出转发给 slog.Info
+type slogWriter struct{}
+
+func (slogWriter) Write(p []byte) (n int, err error) {
+	msg := strings.TrimRight(string(p), "\n")
+	slog.Info(msg)
+	return len(p), nil
+}
+
 func initDB() {
 	var err error
 	db, err = sql.Open("sqlite", "./queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
@@ -38,9 +65,14 @@ func initDB() {
 		payload      TEXT    NOT NULL,
 		attempts     INTEGER NOT NULL DEFAULT 0,
 		status       TEXT    NOT NULL DEFAULT 'pending',
+		priority     INTEGER NOT NULL DEFAULT 5,
+		dedup_key    TEXT    DEFAULT NULL,
 		available_at INTEGER NOT NULL DEFAULT 0,
+		started_at   INTEGER NOT NULL DEFAULT 0,
+		finished_at  INTEGER NOT NULL DEFAULT 0,
 		created_at   INTEGER NOT NULL,
-		updated_at   INTEGER NOT NULL
+		updated_at   INTEGER NOT NULL,
+		UNIQUE(dedup_key) ON CONFLICT IGNORE
 	);
 	CREATE TABLE IF NOT EXISTS failed_jobs (
 		id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,6 +91,11 @@ func initDB() {
 	migrations := []string{
 		`ALTER TABLE failed_jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE failed_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 5`,
+		`ALTER TABLE jobs ADD COLUMN dedup_key TEXT DEFAULT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedup_key ON jobs(dedup_key) WHERE dedup_key IS NOT NULL`,
 	}
 	for _, m := range migrations {
 		if _, err := db.Exec(m); err != nil {
@@ -82,7 +119,10 @@ type Job struct {
 	Payload     string `json:"payload"`
 	Attempts    int    `json:"attempts"`
 	Status      string `json:"status"`
+	Priority    int    `json:"priority"`
 	AvailableAt int64  `json:"available_at"`
+	StartedAt   int64  `json:"started_at"`
+	FinishedAt  int64  `json:"finished_at"`
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 }
@@ -98,20 +138,42 @@ func (j *Job) JobType() string {
 	return p.JobType
 }
 
-func dispatchJob(queue string, jobType string, data interface{}, delaySeconds int64) (int64, error) {
+// DispatchOptions 投递任务的可选参数
+type DispatchOptions struct {
+	Priority int    // 1-10，默认 5
+	DedupKey string // 去重 key，相同 key 的任务只保留一个（pending 状态）
+}
+
+func dispatchJob(queue string, jobType string, data interface{}, delaySeconds int64, opts ...DispatchOptions) (int64, error) {
 	dataBytes, _ := json.Marshal(data)
 	p := Payload{JobType: jobType, Data: dataBytes}
 	payloadBytes, _ := json.Marshal(p)
 	now := time.Now().Unix()
+	prio := 5
+	var dedupKey *string
+	if len(opts) > 0 {
+		if opts[0].Priority >= 1 && opts[0].Priority <= 10 {
+			prio = opts[0].Priority
+		}
+		if opts[0].DedupKey != "" {
+			dedupKey = &opts[0].DedupKey
+		}
+	}
 	res, err := db.Exec(
-		`INSERT INTO jobs (queue, payload, status, available_at, created_at, updated_at)
-		 VALUES (?, ?, 'pending', ?, ?, ?)`,
-		queue, string(payloadBytes), now+delaySeconds, now, now,
+		`INSERT OR IGNORE INTO jobs (queue, payload, status, priority, dedup_key, available_at, created_at, updated_at)
+		 VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`,
+		queue, string(payloadBytes), prio, dedupKey, now+delaySeconds, now, now,
 	)
 	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	id, _ := res.LastInsertId()
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		// 被去重忽略，返回 0 表示未插入
+		return 0, nil
+	}
+	return id, nil
 }
 
 func reserve(queue string) (*Job, error) {
@@ -122,22 +184,22 @@ func reserve(queue string) (*Job, error) {
 	defer tx.Rollback()
 	now := time.Now().Unix()
 	row := tx.QueryRow(
-		`SELECT id, queue, payload, attempts, status, available_at, created_at, updated_at
+		`SELECT id, queue, payload, attempts, status, priority, available_at, started_at, finished_at, created_at, updated_at
 		 FROM jobs WHERE queue=? AND status='pending' AND available_at<=?
-		 ORDER BY id ASC LIMIT 1`,
+		 ORDER BY priority DESC, id ASC LIMIT 1`,
 		queue, now,
 	)
 	var j Job
-	if err := row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status,
-		&j.AvailableAt, &j.CreatedAt, &j.UpdatedAt); err != nil {
+	if err := row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority,
+		&j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
 		return nil, err
 	}
 	if _, err = tx.Exec(
-		`UPDATE jobs SET status='running', attempts=attempts+1, updated_at=? WHERE id=?`,
-		now, j.ID,
+		`UPDATE jobs SET status='running', attempts=attempts+1, started_at=?, updated_at=? WHERE id=?`,
+		now, now, j.ID,
 	); err != nil {
 		return nil, err
 	}
@@ -146,6 +208,7 @@ func reserve(queue string) (*Job, error) {
 	}
 	j.Status = "running"
 	j.Attempts++
+	j.StartedAt = now
 	return &j, nil
 }
 
@@ -156,7 +219,9 @@ const (
 )
 
 func markDone(id int64) {
-	db.Exec(`UPDATE jobs SET status='done', updated_at=? WHERE id=?`, time.Now().Unix(), id)
+	now := time.Now().Unix()
+	db.Exec(`UPDATE jobs SET status='done', finished_at=?, updated_at=? WHERE id=?`, now, now, id)
+	broadcastStats()
 }
 
 // handleJobFailure：失败时先判断是否还有重试机会
@@ -175,7 +240,7 @@ func handleJobFailure(j *Job, reason string) {
 	} else {
 		// 超过最大重试次数，进死信队列
 		jobType := j.JobType()
-		db.Exec(`UPDATE jobs SET status='failed', updated_at=? WHERE id=?`, now, j.ID)
+		db.Exec(`UPDATE jobs SET status='failed', finished_at=?, updated_at=? WHERE id=?`, now, now, j.ID)
 		db.Exec(`INSERT INTO failed_jobs (queue, job_type, payload, attempts, exception, failed_at) VALUES (?,?,?,?,?,?)`,
 			j.Queue, jobType, j.Payload, j.Attempts, reason, now)
 		log.Printf("[Queue] Job #%d → DLQ after %d attempts — reason: %s", j.ID, j.Attempts, reason)
@@ -425,9 +490,9 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 					ack, _ := json.Marshal(WsControl{Type: "ack", Message: fmt.Sprintf("job #%d done", result.JobID)})
 					conn.WriteMessage(1, ack)
 				} else {
-					row := db.QueryRow(`SELECT id,queue,payload,attempts,status,available_at,created_at,updated_at FROM jobs WHERE id=?`, result.JobID)
+					row := db.QueryRow(`SELECT id,queue,payload,attempts,status,priority,available_at,started_at,finished_at,created_at,updated_at FROM jobs WHERE id=?`, result.JobID)
 					var j Job
-					row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.AvailableAt, &j.CreatedAt, &j.UpdatedAt)
+					row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority, &j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt)
 					markFailed(&j, result.Error)
 					log.Printf("[WS] Job #%d failed by worker %s: %s", result.JobID, workerID, result.Error)
 				}
@@ -599,10 +664,12 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 	// 限制请求体最大 1MB，防止恶意大 payload 撑爆内存
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
-		Queue   string          `json:"queue"`
-		JobType string          `json:"job_type"`
-		Data    json.RawMessage `json:"data"`
-		Delay   int64           `json:"delay"`
+		Queue    string          `json:"queue"`
+		JobType  string          `json:"job_type"`
+		Data     json.RawMessage `json:"data"`
+		Delay    int64           `json:"delay"`
+		Priority int             `json:"priority"`
+		DedupKey string          `json:"dedup_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		if strings.Contains(err.Error(), "http: request body too large") {
@@ -615,9 +682,17 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if req.Queue == "" {
 		req.Queue = "default"
 	}
-	id, err := dispatchJob(req.Queue, req.JobType, req.Data, req.Delay)
+	id, err := dispatchJob(req.Queue, req.JobType, req.Data, req.Delay, DispatchOptions{
+		Priority: req.Priority,
+		DedupKey: req.DedupKey,
+	})
 	if err != nil {
 		jsonResp(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if id == 0 {
+		// 被去重忽略
+		jsonResp(w, 200, map[string]interface{}{"job_id": 0, "queue": req.Queue, "status": "deduplicated", "message": "job skipped: duplicate dedup_key"})
 		return
 	}
 	jsonResp(w, 201, map[string]interface{}{"job_id": id, "queue": req.Queue, "status": "pending"})
@@ -629,7 +704,7 @@ func handleListJobs(w http.ResponseWriter, r *http.Request) {
 	if q.Get("limit") != "" {
 		limit = q.Get("limit")
 	}
-	query := `SELECT id,queue,payload,attempts,status,available_at,created_at,updated_at FROM jobs WHERE 1=1`
+	query := `SELECT id,queue,payload,attempts,status,priority,available_at,started_at,finished_at,created_at,updated_at FROM jobs WHERE 1=1`
 	args := []interface{}{}
 	if queue != "" {
 		query += " AND queue=?"
@@ -649,8 +724,8 @@ func handleListJobs(w http.ResponseWriter, r *http.Request) {
 	jobs := []Job{}
 	for rows.Next() {
 		var j Job
-		rows.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status,
-			&j.AvailableAt, &j.CreatedAt, &j.UpdatedAt)
+		rows.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority,
+			&j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt)
 		jobs = append(jobs, j)
 	}
 	jsonResp(w, 200, jobs)
@@ -676,6 +751,31 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	stats["ws_workers"] = hub.count()
 	stats["version"] = "1.0.0"
 	stats["queues"] = []string{"default", "emails"}
+
+	// 平均耗时：只统计 finished_at > 0 且 started_at > 0 的已完成任务
+	var avgMs sql.NullFloat64
+	db.QueryRow(`SELECT AVG((finished_at - started_at) * 1000) FROM jobs
+		WHERE status='done' AND started_at > 0 AND finished_at > 0`).Scan(&avgMs)
+	if avgMs.Valid {
+		stats["avg_duration_ms"] = int64(avgMs.Float64)
+	} else {
+		stats["avg_duration_ms"] = 0
+	}
+
+	// 各队列 pending 数量
+	qRows, _ := db.Query(`SELECT queue, COUNT(*) FROM jobs WHERE status='pending' GROUP BY queue`)
+	if qRows != nil {
+		defer qRows.Close()
+		queuePending := map[string]int{}
+		for qRows.Next() {
+			var q string
+			var c int
+			qRows.Scan(&q, &c)
+			queuePending[q] = c
+		}
+		stats["queue_pending"] = queuePending
+	}
+
 	jsonResp(w, 200, stats)
 }
 
@@ -699,6 +799,142 @@ func handleRetryFailed(w http.ResponseWriter, r *http.Request) {
 }
 
 var startTime = time.Now()
+
+// ─────────────────────────────────────────────
+// SSE — Server-Sent Events 实时推送
+// ─────────────────────────────────────────────
+
+// sseHub 管理所有 SSE 客户端连接
+var sseHub = &SSEHub{clients: make(map[chan string]struct{})}
+
+type SSEHub struct {
+	mu      sync.Mutex
+	clients map[chan string]struct{}
+}
+
+func (h *SSEHub) subscribe() chan string {
+	ch := make(chan string, 4)
+	h.mu.Lock()
+	h.clients[ch] = struct{}{}
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *SSEHub) unsubscribe(ch chan string) {
+	h.mu.Lock()
+	delete(h.clients, ch)
+	h.mu.Unlock()
+}
+
+// Broadcast 向所有 SSE 客户端广播一条消息（非阻塞）
+func (h *SSEHub) Broadcast(data string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.clients {
+		select {
+		case ch <- data:
+		default: // 客户端消费太慢，丢弃
+		}
+	}
+}
+
+// handleSSE 处理 GET /api/events，返回 SSE 流
+func handleSSE(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", 500)
+		return
+	}
+
+	ch := sseHub.subscribe()
+	defer sseHub.unsubscribe(ch)
+
+	// 立即推送一次当前 stats
+	go func() { sseHub.Broadcast("refresh") }()
+
+	for {
+		select {
+		case msg := <-ch:
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// broadcastStats 在任务状态变化时广播 SSE 事件
+func broadcastStats() {
+	sseHub.Broadcast("refresh")
+}
+
+// handleMetrics 输出 Prometheus text format 指标
+// 指标：jobs_total{status,queue}、ws_workers_total、avg_duration_ms、uptime_seconds
+func handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+
+	// jobs_total by status
+	rows, _ := db.Query(`SELECT status, COUNT(*) FROM jobs GROUP BY status`)
+	if rows != nil {
+		defer rows.Close()
+		fmt.Fprintln(w, "# HELP jobs_total Total number of jobs by status")
+		fmt.Fprintln(w, "# TYPE jobs_total gauge")
+		for rows.Next() {
+			var s string
+			var c int
+			rows.Scan(&s, &c)
+			fmt.Fprintf(w, `jobs_total{status=%q} %d`+"\n", s, c)
+		}
+	}
+
+	// jobs_total by queue+status
+	qRows, _ := db.Query(`SELECT queue, status, COUNT(*) FROM jobs GROUP BY queue, status`)
+	if qRows != nil {
+		defer qRows.Close()
+		fmt.Fprintln(w, "# HELP jobs_by_queue_total Total jobs by queue and status")
+		fmt.Fprintln(w, "# TYPE jobs_by_queue_total gauge")
+		for qRows.Next() {
+			var q, s string
+			var c int
+			qRows.Scan(&q, &s, &c)
+			fmt.Fprintf(w, `jobs_by_queue_total{queue=%q,status=%q} %d`+"\n", q, s, c)
+		}
+	}
+
+	// failed_jobs_total (DLQ)
+	var dlq int
+	db.QueryRow(`SELECT COUNT(*) FROM failed_jobs`).Scan(&dlq)
+	fmt.Fprintln(w, "# HELP failed_jobs_total Total jobs in dead-letter queue")
+	fmt.Fprintln(w, "# TYPE failed_jobs_total gauge")
+	fmt.Fprintf(w, "failed_jobs_total %d\n", dlq)
+
+	// ws_workers_total
+	fmt.Fprintln(w, "# HELP ws_workers_total Currently connected WebSocket workers")
+	fmt.Fprintln(w, "# TYPE ws_workers_total gauge")
+	fmt.Fprintf(w, "ws_workers_total %d\n", hub.count())
+
+	// avg_duration_ms
+	var avgMs sql.NullFloat64
+	db.QueryRow(`SELECT AVG((finished_at - started_at) * 1000) FROM jobs
+		WHERE status='done' AND started_at > 0 AND finished_at > 0`).Scan(&avgMs)
+	fmt.Fprintln(w, "# HELP job_avg_duration_ms Average job execution duration in milliseconds")
+	fmt.Fprintln(w, "# TYPE job_avg_duration_ms gauge")
+	if avgMs.Valid {
+		fmt.Fprintf(w, "job_avg_duration_ms %.2f\n", avgMs.Float64*1000)
+	} else {
+		fmt.Fprintln(w, "job_avg_duration_ms 0")
+	}
+
+	// uptime_seconds
+	fmt.Fprintln(w, "# HELP uptime_seconds Seconds since process start")
+	fmt.Fprintln(w, "# TYPE uptime_seconds counter")
+	fmt.Fprintf(w, "uptime_seconds %.0f\n", time.Since(startTime).Seconds())
+}
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// 检查 DB 连通性
@@ -734,6 +970,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────
 
 func main() {
+	initLogger()
 	initDB()
 
 	startStaleJobReaper()
@@ -743,11 +980,25 @@ func main() {
 	startWsDispatcher("emails")
 
 	mux := http.NewServeMux()
+	// API 鉴权中间件：读取环境变量 API_KEY，若设置则要求请求携带 X-API-Key header
+	apiKey := os.Getenv("API_KEY")
+	auth := func(h http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if apiKey != "" && r.Header.Get("X-API-Key") != apiKey {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(401)
+				w.Write([]byte(`{"error":"unauthorized: invalid or missing X-API-Key"}`))
+				return
+			}
+			h(w, r)
+		}
+	}
+
 	cors := func(h http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type,X-API-Key")
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(204)
 				return
@@ -758,25 +1009,27 @@ func main() {
 
 	mux.HandleFunc("/", handleIndex)
 	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/metrics", handleMetrics)
 	mux.HandleFunc("/ws/worker", handleWorkerWS)
-	mux.HandleFunc("/api/jobs", cors(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/jobs", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleDispatch(w, r)
 		} else {
 			handleListJobs(w, r)
 		}
-	}))
+	})))
 	// /api/jobs/:id — DELETE to cancel a pending job
-	mux.HandleFunc("/api/jobs/", cors(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/jobs/", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			handleCancelJob(w, r)
 		} else {
 			http.NotFound(w, r)
 		}
-	}))
-	mux.HandleFunc("/api/stats", cors(handleStats))
-	mux.HandleFunc("/api/jobs/failed", cors(handleClearFailed))
-	mux.HandleFunc("/api/jobs/retry-failed", cors(handleRetryFailed))
+	})))
+	mux.HandleFunc("/api/stats", cors(auth(handleStats)))
+	mux.HandleFunc("/api/events", handleSSE)
+	mux.HandleFunc("/api/jobs/failed", cors(auth(handleClearFailed)))
+	mux.HandleFunc("/api/jobs/retry-failed", cors(auth(handleRetryFailed)))
 
 	srv := &http.Server{Addr: ":8080", Handler: mux}
 	go func() {
