@@ -403,9 +403,11 @@ type BatchStatus struct {
 	Failed      int    `json:"failed"`
 	Pending     int    `json:"pending"`
 	Status      string `json:"status"` // pending/running/done/failed
-	ThenJobJSON string `json:"then_job,omitempty"`
-	CreatedAt   int64  `json:"created_at"`
-	FinishedAt  int64  `json:"finished_at,omitempty"`
+	ThenJobJSON    string `json:"then_job,omitempty"`
+	CatchJobJSON   string `json:"catch_job,omitempty"`
+	FinallyJobJSON string `json:"finally_job,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
+	FinishedAt     int64  `json:"finished_at,omitempty"`
 }
 
 // initBatchDB 初始化批次相关表
@@ -416,6 +418,8 @@ func initBatchDB() {
 		name TEXT NOT NULL DEFAULT '',
 		total INTEGER NOT NULL DEFAULT 0,
 		then_job TEXT NOT NULL DEFAULT '',
+		catch_job TEXT NOT NULL DEFAULT '',
+		finally_job TEXT NOT NULL DEFAULT '',
 		status TEXT NOT NULL DEFAULT 'pending',
 		created_at INTEGER NOT NULL,
 		finished_at INTEGER NOT NULL DEFAULT 0
@@ -428,6 +432,8 @@ func initBatchDB() {
 	migrations := []string{
 		`ALTER TABLE jobs ADD COLUMN batch_id INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN next_job TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE job_batches ADD COLUMN catch_job TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE job_batches ADD COLUMN finally_job TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, m := range migrations {
 		if _, err := db.Exec(m); err != nil {
@@ -453,11 +459,11 @@ func containsStrHelper(s, sub string) bool {
 }
 
 // createBatch 创建一个批次，返回 batch_id
-func createBatch(name string, thenJobJSON string) (int64, error) {
+func createBatch(name string, thenJobJSON string, catchJobJSON string, finallyJobJSON string) (int64, error) {
 	now := time.Now().Unix()
 	res, err := db.Exec(
-		`INSERT INTO job_batches (name, total, then_job, status, created_at) VALUES (?, 0, ?, 'pending', ?)`,
-		name, thenJobJSON, now,
+		`INSERT INTO job_batches (name, total, then_job, catch_job, finally_job, status, created_at) VALUES (?, 0, ?, ?, ?, 'pending', ?)`,
+		name, thenJobJSON, catchJobJSON, finallyJobJSON, now,
 	)
 	if err != nil {
 		return 0, err
@@ -504,14 +510,24 @@ func checkBatchCompletion(jobID int64) {
 	log.Printf("[Batch] Batch #%d completed: status=%s total=%d done=%d failed=%d",
 		batchID, finalStatus, total, done, failed)
 
-	// 触发 then_job 回调（仅在全部成功时）
-	if finalStatus == "done" {
-		var thenJob string
-		db.QueryRow(`SELECT then_job FROM job_batches WHERE id=?`, batchID).Scan(&thenJob)
-		if thenJob != "" {
-			dispatchChainedJob(thenJob)
-			log.Printf("[Batch] Batch #%d then_job dispatched", batchID)
-		}
+	// 触发回调
+	var thenJob, catchJob, finallyJob string
+	db.QueryRow(`SELECT then_job, catch_job, finally_job FROM job_batches WHERE id=?`, batchID).Scan(&thenJob, &catchJob, &finallyJob)
+
+	// then_job：全部成功时触发
+	if finalStatus == "done" && thenJob != "" {
+		dispatchChainedJob(thenJob)
+		log.Printf("[Batch] Batch #%d then_job dispatched", batchID)
+	}
+	// catch_job：有任何失败时触发
+	if finalStatus == "failed" && catchJob != "" {
+		dispatchChainedJob(catchJob)
+		log.Printf("[Batch] Batch #%d catch_job dispatched", batchID)
+	}
+	// finally_job：无论成功失败都触发
+	if finallyJob != "" {
+		dispatchChainedJob(finallyJob)
+		log.Printf("[Batch] Batch #%d finally_job dispatched", batchID)
 	}
 	broadcastStats()
 }
@@ -519,12 +535,25 @@ func checkBatchCompletion(jobID int64) {
 // getBatchStatus 获取批次状态
 func getBatchStatus(batchID int64) (*BatchStatus, error) {
 	var b BatchStatus
-	row := db.QueryRow(`SELECT id, name, total, then_job, status, created_at, finished_at FROM job_batches WHERE id=?`, batchID)
-	if err := row.Scan(&b.ID, &b.Name, &b.Total, &b.ThenJobJSON, &b.Status, &b.CreatedAt, &b.FinishedAt); err != nil {
+	// 用单次 JOIN 查询替代 3 次独立查询，避免 SQLite 锁竞争
+	const q = `
+		SELECT
+			b.id, b.name, b.total, b.then_job, b.catch_job, b.finally_job,
+			b.status, b.created_at, b.finished_at,
+			COUNT(CASE WHEN j.status='done' THEN 1 END)                    AS done_cnt,
+			COUNT(CASE WHEN j.status IN ('failed','cancelled') THEN 1 END) AS fail_cnt
+		FROM job_batches b
+		LEFT JOIN jobs j ON j.batch_id = b.id
+		WHERE b.id = ?
+		GROUP BY b.id`
+	row := db.QueryRow(q, batchID)
+	if err := row.Scan(
+		&b.ID, &b.Name, &b.Total, &b.ThenJobJSON, &b.CatchJobJSON, &b.FinallyJobJSON,
+		&b.Status, &b.CreatedAt, &b.FinishedAt,
+		&b.Done, &b.Failed,
+	); err != nil {
 		return nil, err
 	}
-	db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE batch_id=? AND status='done'`, batchID).Scan(&b.Done)
-	db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE batch_id=? AND status IN ('failed','cancelled')`, batchID).Scan(&b.Failed)
 	b.Pending = b.Total - b.Done - b.Failed
 	if b.Pending < 0 {
 		b.Pending = 0
@@ -539,9 +568,11 @@ func handleBatches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name    string          `json:"name"`
-		Jobs    []ChainedJob    `json:"jobs"`
-		ThenJob *ChainedJob     `json:"then_job,omitempty"`
+		Name       string       `json:"name"`
+		Jobs       []ChainedJob `json:"jobs"`
+		ThenJob    *ChainedJob  `json:"then_job,omitempty"`
+		CatchJob   *ChainedJob  `json:"catch_job,omitempty"`
+		FinallyJob *ChainedJob  `json:"finally_job,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonResp(w, 400, map[string]string{"error": err.Error()})
@@ -552,15 +583,25 @@ func handleBatches(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 序列化 then_job
+	// 序列化 then_job / catch_job / finally_job
 	thenJobJSON := ""
 	if req.ThenJob != nil {
 		b, _ := json.Marshal(req.ThenJob)
 		thenJobJSON = string(b)
 	}
+	catchJobJSON := ""
+	if req.CatchJob != nil {
+		b, _ := json.Marshal(req.CatchJob)
+		catchJobJSON = string(b)
+	}
+	finallyJobJSON := ""
+	if req.FinallyJob != nil {
+		b, _ := json.Marshal(req.FinallyJob)
+		finallyJobJSON = string(b)
+	}
 
 	// 创建批次
-	batchID, err := createBatch(req.Name, thenJobJSON)
+	batchID, err := createBatch(req.Name, thenJobJSON, catchJobJSON, finallyJobJSON)
 	if err != nil {
 		jsonResp(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -639,7 +680,19 @@ func handleBatchList(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	rows, err := db.Query(`SELECT id, name, total, then_job, status, created_at, finished_at FROM job_batches ORDER BY id DESC LIMIT 50`)
+	// 用单次 LEFT JOIN + GROUP BY 替代 N 次子查询，避免 SQLite 锁竞争导致超时
+	const q = `
+		SELECT
+			b.id, b.name, b.total, b.then_job, b.catch_job, b.finally_job,
+			b.status, b.created_at, b.finished_at,
+			COUNT(CASE WHEN j.status='done' THEN 1 END)                    AS done_cnt,
+			COUNT(CASE WHEN j.status IN ('failed','cancelled') THEN 1 END) AS fail_cnt
+		FROM job_batches b
+		LEFT JOIN jobs j ON j.batch_id = b.id
+		GROUP BY b.id
+		ORDER BY b.id DESC
+		LIMIT 50`
+	rows, err := db.Query(q)
 	if err != nil {
 		jsonResp(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -648,9 +701,11 @@ func handleBatchList(w http.ResponseWriter, r *http.Request) {
 	batches := []BatchStatus{}
 	for rows.Next() {
 		var b BatchStatus
-		rows.Scan(&b.ID, &b.Name, &b.Total, &b.ThenJobJSON, &b.Status, &b.CreatedAt, &b.FinishedAt)
-		db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE batch_id=? AND status='done'`, b.ID).Scan(&b.Done)
-		db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE batch_id=? AND status IN ('failed','cancelled')`, b.ID).Scan(&b.Failed)
+		rows.Scan(
+			&b.ID, &b.Name, &b.Total, &b.ThenJobJSON, &b.CatchJobJSON, &b.FinallyJobJSON,
+			&b.Status, &b.CreatedAt, &b.FinishedAt,
+			&b.Done, &b.Failed,
+		)
 		b.Pending = b.Total - b.Done - b.Failed
 		if b.Pending < 0 {
 			b.Pending = 0

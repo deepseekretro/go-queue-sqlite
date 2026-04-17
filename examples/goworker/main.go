@@ -6,12 +6,17 @@ package main
 //
 //  服务端 → Worker（JSON）：
 //    连接成功：{"type":"connected","message":"..."}
-//    派发任务：{"type":"job","job_id":1,"queue":"default","job_type":"send_email","payload":"{...}"}
+//    派发任务：{"type":"job","job_id":1,"queue":"default","job_type":"send_email","payload":"{...}","tags":["email","promo"]}
 //    任务确认：{"type":"ack","message":"job #1 done"}
 //
 //  Worker → 服务端（JSON）：
 //    任务成功：{"type":"result","job_id":1,"success":true,"log":"..."}
 //    任务失败：{"type":"result","job_id":1,"success":false,"error":"..."}
+//
+// 新特性（v4）：
+//   - tags：任务可携带标签，Worker 可按标签路由或过滤
+//   - batch catch/finally：批次失败/完成回调
+//   - queue pause/resume：队列可暂停，暂停期间任务不派发
 
 import (
 	"context"
@@ -34,407 +39,265 @@ import (
 // 消息结构（与服务端保持一致）
 // ─────────────────────────────────────────────
 
-// WsJobMessage 服务端推送的任务消息
-type WsJobMessage struct {
-	Type    string `json:"type"`
-	JobID   int64  `json:"job_id"`
-	Queue   string `json:"queue"`
-	JobType string `json:"job_type"`
-	Payload string `json:"payload"`
+// WsMessage 是服务端下发的消息
+type WsMessage struct {
+	Type    string          `json:"type"`
+	JobID   int64           `json:"job_id,omitempty"`
+	Queue   string          `json:"queue,omitempty"`
+	JobType string          `json:"job_type,omitempty"`
+	Payload string          `json:"payload,omitempty"`
+	Tags    []string        `json:"tags,omitempty"`   // v4: 任务标签
+	Message string          `json:"message,omitempty"`
+	Error   string          `json:"error,omitempty"`
 }
 
-// WsResultMessage Worker 回报的结果消息
-type WsResultMessage struct {
+// ResultMessage 是 Worker 上报的结果
+type ResultMessage struct {
 	Type    string `json:"type"`
 	JobID   int64  `json:"job_id"`
 	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
 	Log     string `json:"log,omitempty"`
-}
-
-// WsControl 控制消息（connected / ack / ping）
-type WsControl struct {
-	Type    string `json:"type"`
-	Message string `json:"message,omitempty"`
-}
-
-// Payload 任务 payload 结构（与服务端一致）
-type Payload struct {
-	JobType     string          `json:"job_type"`
-	Data        json.RawMessage `json:"data"`
-	TimeoutSec  int             `json:"timeout_sec"`
-	MaxAttempts int             `json:"max_attempts"`
-	Backoff     []int           `json:"backoff"`
+	Error   string `json:"error,omitempty"`
 }
 
 // ─────────────────────────────────────────────
-// Job Handler 注册表
+// Handler 注册表
 // ─────────────────────────────────────────────
 
-// JobHandlerFunc 任务处理函数签名
-// ctx: 超时控制 context
-// jobID: 任务 ID
-// data: payload.data 原始 JSON
-// 返回 log 字符串（成功时）或 error（失败时）
-type JobHandlerFunc func(ctx context.Context, jobID int64, data json.RawMessage) (string, error)
+// JobHandler 是任务处理函数类型
+// data: 解析后的 payload（map）
+// tags: 任务标签（v4 新增）
+type JobHandler func(ctx context.Context, data map[string]interface{}, tags []string) (string, error)
 
 var (
+	handlers   = map[string]JobHandler{}
 	handlersMu sync.RWMutex
-	handlers   = map[string]JobHandlerFunc{}
 )
 
-// RegisterHandler 注册一个 job_type 的处理函数
-func RegisterHandler(jobType string, fn JobHandlerFunc) {
+// Register 注册一个 job_type 对应的处理函数
+func Register(jobType string, h JobHandler) {
 	handlersMu.Lock()
 	defer handlersMu.Unlock()
-	handlers[jobType] = fn
-	log.Printf("[Worker] Registered handler: %s", jobType)
+	handlers[jobType] = h
 }
 
 // ─────────────────────────────────────────────
-// 内置 Job Handlers（示例实现）
+// Worker 配置
 // ─────────────────────────────────────────────
 
-func init() {
-	// generate_report: 模拟生成报告（随机耗时 100-500ms）
-	RegisterHandler("generate_report", func(ctx context.Context, jobID int64, data json.RawMessage) (string, error) {
-		var d struct {
-			Name   string `json:"name"`
-			Report string `json:"report"`
-		}
-		json.Unmarshal(data, &d)
-		name := d.Name
-		if name == "" {
-			name = d.Report
-		}
-		if name == "" {
-			name = "unknown"
-		}
-
-		// 模拟耗时操作
-		delay := time.Duration(100+rand.Intn(400)) * time.Millisecond
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return "", fmt.Errorf("generate_report cancelled: %v", ctx.Err())
-		}
-
-		return fmt.Sprintf("Report '%s' generated in %v", name, delay.Round(time.Millisecond)), nil
-	})
-
-	// send_email: 模拟发送邮件（随机耗时 50-200ms）
-	RegisterHandler("send_email", func(ctx context.Context, jobID int64, data json.RawMessage) (string, error) {
-		var d struct {
-			To      string `json:"to"`
-			Subject string `json:"subject"`
-		}
-		json.Unmarshal(data, &d)
-		if d.To == "" {
-			d.To = "unknown@example.com"
-		}
-
-		delay := time.Duration(50+rand.Intn(150)) * time.Millisecond
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return "", fmt.Errorf("send_email cancelled: %v", ctx.Err())
-		}
-
-		return fmt.Sprintf("Email sent to %s (subject: %q) in %v", d.To, d.Subject, delay.Round(time.Millisecond)), nil
-	})
-
-	// resize_image: 模拟图片处理（随机耗时 200-800ms）
-	RegisterHandler("resize_image", func(ctx context.Context, jobID int64, data json.RawMessage) (string, error) {
-		var d struct {
-			URL    string `json:"url"`
-			Width  int    `json:"width"`
-			Height int    `json:"height"`
-		}
-		json.Unmarshal(data, &d)
-
-		delay := time.Duration(200+rand.Intn(600)) * time.Millisecond
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return "", fmt.Errorf("resize_image cancelled: %v", ctx.Err())
-		}
-
-		return fmt.Sprintf("Image %s resized to %dx%d in %v", d.URL, d.Width, d.Height, delay.Round(time.Millisecond)), nil
-	})
-
-	// data_sync: 模拟数据同步（随机耗时 300-1000ms）
-	RegisterHandler("data_sync", func(ctx context.Context, jobID int64, data json.RawMessage) (string, error) {
-		var d struct {
-			Source string `json:"source"`
-			Target string `json:"target"`
-		}
-		json.Unmarshal(data, &d)
-
-		delay := time.Duration(300+rand.Intn(700)) * time.Millisecond
-		select {
-		case <-time.After(delay):
-		case <-ctx.Done():
-			return "", fmt.Errorf("data_sync cancelled: %v", ctx.Err())
-		}
-
-		return fmt.Sprintf("Synced %s → %s in %v", d.Source, d.Target, delay.Round(time.Millisecond)), nil
-	})
-
-	// fail_test: 专门用于测试失败重试的 handler（总是失败）
-	RegisterHandler("fail_test", func(ctx context.Context, jobID int64, data json.RawMessage) (string, error) {
-		return "", fmt.Errorf("intentional failure for testing (job #%d)", jobID)
-	})
-}
-
-// ─────────────────────────────────────────────
-// processJob 执行一个任务
-// ─────────────────────────────────────────────
-
-func processJob(jobMsg WsJobMessage) WsResultMessage {
-	// 解析 payload
-	var pf Payload
-	if err := json.Unmarshal([]byte(jobMsg.Payload), &pf); err != nil {
-		return WsResultMessage{
-			Type:    "result",
-			JobID:   jobMsg.JobID,
-			Success: false,
-			Error:   fmt.Sprintf("invalid payload JSON: %v", err),
-		}
-	}
-
-	// 确定 job_type（优先用 payload 里的，其次用消息里的）
-	jobType := pf.JobType
-	if jobType == "" {
-		jobType = jobMsg.JobType
-	}
-
-	// 查找 handler
-	handlersMu.RLock()
-	fn, ok := handlers[jobType]
-	handlersMu.RUnlock()
-
-	if !ok {
-		return WsResultMessage{
-			Type:    "result",
-			JobID:   jobMsg.JobID,
-			Success: false,
-			Error:   fmt.Sprintf("unknown job type: %q", jobType),
-		}
-	}
-
-	// 超时控制
-	timeoutSec := pf.TimeoutSec
-	if timeoutSec <= 0 {
-		timeoutSec = 60
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
-	defer cancel()
-
-	log.Printf("[Worker] Processing job #%d type=%s queue=%s timeout=%ds",
-		jobMsg.JobID, jobType, jobMsg.Queue, timeoutSec)
-
-	start := time.Now()
-	logStr, err := fn(ctx, jobMsg.JobID, pf.Data)
-	elapsed := time.Since(start).Round(time.Millisecond)
-
-	if err != nil {
-		log.Printf("[Worker] Job #%d FAILED in %v: %v", jobMsg.JobID, elapsed, err)
-		return WsResultMessage{
-			Type:    "result",
-			JobID:   jobMsg.JobID,
-			Success: false,
-			Error:   err.Error(),
-		}
-	}
-
-	log.Printf("[Worker] Job #%d DONE in %v: %s", jobMsg.JobID, elapsed, logStr)
-	return WsResultMessage{
-		Type:    "result",
-		JobID:   jobMsg.JobID,
-		Success: true,
-		Log:     logStr,
-	}
-}
-
-// ─────────────────────────────────────────────
-// Worker 连接主循环
-// ─────────────────────────────────────────────
-
-// WorkerConfig Worker 配置
 type WorkerConfig struct {
-	ServerURL   string        // WebSocket 服务端地址，如 ws://localhost:8080/ws/worker
-	Queue       string        // 监听的队列名
-	APIKey      string        // 可选：API Key（X-Api-Key header）
-	Concurrency int           // 并发处理任务数（默认 1）
-	ReconnectDelay time.Duration // 断线重连间隔（默认 3s）
-	MaxReconnects  int           // 最大重连次数（0 = 无限）
+	ServerURL      string
+	Queue          string
+	APIKey         string
+	Concurrency    int
+	ReconnectDelay time.Duration
 }
 
-// runWorker 启动一个 Worker 连接（带自动重连）
-func runWorker(cfg WorkerConfig, stopCh <-chan struct{}) {
-	if cfg.ReconnectDelay <= 0 {
-		cfg.ReconnectDelay = 3 * time.Second
-	}
-	if cfg.Concurrency <= 0 {
-		cfg.Concurrency = 1
-	}
+// ─────────────────────────────────────────────
+// Worker 核心
+// ─────────────────────────────────────────────
 
-	reconnects := 0
+func runWorker(cfg WorkerConfig, stopCh <-chan struct{}) {
+	sem := make(chan struct{}, cfg.Concurrency)
+
 	for {
 		select {
 		case <-stopCh:
-			log.Printf("[Worker] Stopped (queue=%s)", cfg.Queue)
 			return
 		default:
 		}
 
-		if cfg.MaxReconnects > 0 && reconnects >= cfg.MaxReconnects {
-			log.Printf("[Worker] Max reconnects (%d) reached, stopping", cfg.MaxReconnects)
-			return
-		}
-
-		url := cfg.ServerURL
-		if !strings.Contains(url, "queue=") {
-			sep := "?"
-			if strings.Contains(url, "?") {
-				sep = "&"
-			}
-			url = url + sep + "queue=" + cfg.Queue
-		}
-
-		log.Printf("[Worker] Connecting to %s (attempt %d)", url, reconnects+1)
-
-		header := make(map[string][]string)
+		wsURL := fmt.Sprintf("%s?queue=%s", cfg.ServerURL, cfg.Queue)
+		dialHeader := map[string][]string{}
 		if cfg.APIKey != "" {
-			header["X-Api-Key"] = []string{cfg.APIKey}
+			dialHeader["Authorization"] = []string{"Bearer " + cfg.APIKey}
 		}
 
-		dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-		conn, _, err := dialer.Dial(url, header)
+		log.Printf("[Worker] Connecting to %s ...", wsURL)
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, dialHeader)
 		if err != nil {
-			log.Printf("[Worker] Connection failed: %v, retrying in %v", err, cfg.ReconnectDelay)
-			reconnects++
+			log.Printf("[Worker] Connect failed: %v, retry in %v", err, cfg.ReconnectDelay)
 			select {
-			case <-time.After(cfg.ReconnectDelay):
 			case <-stopCh:
 				return
+			case <-time.After(cfg.ReconnectDelay):
 			}
 			continue
 		}
+		log.Printf("[Worker] Connected ✓")
 
-		log.Printf("[Worker] Connected to %s (queue=%s)", cfg.ServerURL, cfg.Queue)
-		reconnects = 0
+		// 心跳
+		pingStop := make(chan struct{})
+		go func() {
+			ticker := time.NewTicker(20 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					conn.WriteMessage(websocket.PingMessage, nil)
+				case <-pingStop:
+					return
+				}
+			}
+		}()
 
-		// 运行连接会话
-		disconnected := runSession(conn, cfg, stopCh)
-		conn.Close()
+		// 读消息循环
+		disconnected := false
+		for !disconnected {
+			_, raw, err := conn.ReadMessage()
+			if err != nil {
+				log.Printf("[Worker] Read error: %v", err)
+				disconnected = true
+				break
+			}
 
-		if !disconnected {
-			// 主动停止
-			return
+			var msg WsMessage
+			if err := json.Unmarshal(raw, &msg); err != nil {
+				log.Printf("[Worker] JSON parse error: %v", err)
+				continue
+			}
+
+			switch msg.Type {
+			case "connected":
+				log.Printf("[Worker] Server: %s", msg.Message)
+			case "job":
+				sem <- struct{}{}
+				go func(m WsMessage) {
+					defer func() { <-sem }()
+					handleJob(conn, m)
+				}(msg)
+			case "ack":
+				log.Printf("[Worker] ACK: %s", msg.Message)
+			default:
+				log.Printf("[Worker] Unknown message type: %s", msg.Type)
+			}
 		}
 
-		log.Printf("[Worker] Disconnected, reconnecting in %v...", cfg.ReconnectDelay)
+		close(pingStop)
+		conn.Close()
+
 		select {
-		case <-time.After(cfg.ReconnectDelay):
 		case <-stopCh:
 			return
+		case <-time.After(cfg.ReconnectDelay + time.Duration(rand.Intn(1000))*time.Millisecond):
 		}
 	}
 }
 
-// runSession 在一个 WebSocket 连接上运行任务处理循环
-// 返回 true 表示需要重连，false 表示主动停止
-func runSession(conn *websocket.Conn, cfg WorkerConfig, stopCh <-chan struct{}) bool {
-	// 并发控制信号量
-	sem := make(chan struct{}, cfg.Concurrency)
-	var wg sync.WaitGroup
+// handleJob 处理单个任务
+func handleJob(conn *websocket.Conn, msg WsMessage) {
+	log.Printf("[Job #%d] type=%s queue=%s tags=%v", msg.JobID, msg.JobType, msg.Queue, msg.Tags)
 
-	// 读取消息循环
-	msgCh := make(chan []byte, 16)
-	errCh := make(chan error, 1)
+	// 解析 payload
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(msg.Payload), &data); err != nil {
+		sendResult(conn, msg.JobID, false, "", fmt.Sprintf("payload parse error: %v", err))
+		return
+	}
 
-	go func() {
-		for {
-			_, msg, err := conn.ReadMessage()
-			if err != nil {
-				errCh <- err
-				return
-			}
-			msgCh <- msg
-		}
-	}()
+	// 查找 handler
+	handlersMu.RLock()
+	h, ok := handlers[msg.JobType]
+	handlersMu.RUnlock()
 
-	// 心跳 ticker（每 20s 发一次 ping，防止连接被服务端超时断开）
-	pingTicker := time.NewTicker(20 * time.Second)
-	defer pingTicker.Stop()
+	if !ok {
+		log.Printf("[Job #%d] No handler for job_type=%s", msg.JobID, msg.JobType)
+		sendResult(conn, msg.JobID, false, "", fmt.Sprintf("no handler for job_type: %s", msg.JobType))
+		return
+	}
 
-	for {
-		select {
-		case <-stopCh:
-			log.Printf("[Worker] Graceful shutdown: waiting for running jobs...")
-			wg.Wait()
-			return false
+	// 执行（带超时）
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
 
-		case err := <-errCh:
-			log.Printf("[Worker] Read error: %v", err)
-			wg.Wait()
-			return true
+	result, err := h(ctx, data, msg.Tags)
+	if err != nil {
+		log.Printf("[Job #%d] FAILED: %v", msg.JobID, err)
+		sendResult(conn, msg.JobID, false, "", err.Error())
+	} else {
+		log.Printf("[Job #%d] OK: %s", msg.JobID, result)
+		sendResult(conn, msg.JobID, true, result, "")
+	}
+}
 
-		case <-pingTicker.C:
-			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				log.Printf("[Worker] Ping failed: %v", err)
-				wg.Wait()
-				return true
-			}
+// sendResult 上报任务结果
+func sendResult(conn *websocket.Conn, jobID int64, success bool, logMsg, errMsg string) {
+	res := ResultMessage{
+		Type:    "result",
+		JobID:   jobID,
+		Success: success,
+		Log:     logMsg,
+		Error:   errMsg,
+	}
+	b, _ := json.Marshal(res)
+	conn.WriteMessage(websocket.TextMessage, b)
+}
 
-		case msg := <-msgCh:
-			// 解析消息类型
-			var ctrl WsControl
-			if err := json.Unmarshal(msg, &ctrl); err != nil {
-				log.Printf("[Worker] Invalid message: %s", msg)
-				continue
-			}
+// ─────────────────────────────────────────────
+// 示例 Job Handlers
+// ─────────────────────────────────────────────
 
-			switch ctrl.Type {
-			case "connected":
-				log.Printf("[Worker] Server: %s", ctrl.Message)
+func handleSendEmail(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+	to, _ := data["to"].(string)
+	subject, _ := data["subject"].(string)
+	log.Printf("[send_email] to=%s subject=%s tags=%v", to, subject, tags)
+	time.Sleep(300 * time.Millisecond)
+	return fmt.Sprintf("Email sent to %s", to), nil
+}
 
-			case "ack":
-				log.Printf("[Worker] ACK: %s", ctrl.Message)
+func handleGenerateReport(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+	name, _ := data["name"].(string)
+	log.Printf("[generate_report] name=%s tags=%v", name, tags)
+	time.Sleep(800 * time.Millisecond)
+	return fmt.Sprintf("Report %q generated", name), nil
+}
 
-			case "job":
-				// 解析任务消息
-				var jobMsg WsJobMessage
-				if err := json.Unmarshal(msg, &jobMsg); err != nil {
-					log.Printf("[Worker] Invalid job message: %v", err)
-					continue
-				}
+func handleResizeImage(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+	url, _ := data["url"].(string)
+	w, _ := data["width"].(float64)
+	h, _ := data["height"].(float64)
+	log.Printf("[resize_image] url=%s size=%.0fx%.0f tags=%v", url, w, h, tags)
+	time.Sleep(500 * time.Millisecond)
+	return fmt.Sprintf("Image %s resized to %.0fx%.0f", url, w, h), nil
+}
 
-				// 获取并发槽
-				sem <- struct{}{}
-				wg.Add(1)
+func handleDataSync(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+	src, _ := data["source"].(string)
+	dst, _ := data["target"].(string)
+	log.Printf("[data_sync] %s → %s tags=%v", src, dst, tags)
+	time.Sleep(600 * time.Millisecond)
+	return fmt.Sprintf("Synced %s → %s", src, dst), nil
+}
 
-				go func(jm WsJobMessage) {
-					defer func() {
-						<-sem
-						wg.Done()
-					}()
+// handleTagTask 演示如何根据 tags 做不同处理（v4 新增）
+func handleTagTask(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+	msg, _ := data["message"].(string)
+	log.Printf("[tag_task] message=%s tags=%v", msg, tags)
 
-					result := processJob(jm)
-					resultBytes, _ := json.Marshal(result)
-
-					// 发送结果（需要加锁，WebSocket 写操作非线程安全）
-					if err := conn.WriteMessage(websocket.TextMessage, resultBytes); err != nil {
-						log.Printf("[Worker] Failed to send result for job #%d: %v", jm.JobID, err)
-					}
-				}(jobMsg)
-
-			default:
-				log.Printf("[Worker] Unknown message type: %s (raw: %s)", ctrl.Type, msg)
-			}
+	// 根据 tag 做不同处理
+	for _, tag := range tags {
+		switch tag {
+		case "urgent":
+			log.Printf("[tag_task] 紧急任务，优先处理")
+		case "dry-run":
+			log.Printf("[tag_task] dry-run 模式，跳过实际操作")
+			return "dry-run: skipped", nil
+		case "notify":
+			log.Printf("[tag_task] 需要发送通知")
 		}
 	}
+
+	time.Sleep(200 * time.Millisecond)
+	return fmt.Sprintf("tag_task done: %s (tags=%v)", msg, tags), nil
+}
+
+// handleBatchCallback 处理 batch 的 then/catch/finally 回调（v4 新增）
+func handleBatchCallback(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+	batchID, _ := data["batch_id"].(float64)
+	status, _ := data["status"].(string)
+	log.Printf("[batch_callback] batch_id=%.0f status=%s tags=%v", batchID, status, tags)
+	// 在这里可以发送通知、更新数据库等
+	return fmt.Sprintf("batch %.0f callback handled (status=%s)", batchID, status), nil
 }
 
 // ─────────────────────────────────────────────
@@ -442,40 +305,33 @@ func runSession(conn *websocket.Conn, cfg WorkerConfig, stopCh <-chan struct{}) 
 // ─────────────────────────────────────────────
 
 func main() {
-	// 命令行参数
-	serverURL   := flag.String("server", "ws://localhost:8080/ws/worker", "Queue server WebSocket URL")
-	queue       := flag.String("queue", "default", "Queue name to consume")
-	apiKey      := flag.String("api-key", "", "API key (X-Api-Key header)")
-	concurrency := flag.Int("concurrency", 1, "Number of concurrent jobs per connection")
-	connections := flag.Int("connections", 1, "Number of parallel WebSocket connections")
-	reconnDelay := flag.Duration("reconnect", 3*time.Second, "Reconnect delay on disconnect")
+	serverURL   := flag.String("server",      "ws://localhost:8080/ws/worker", "WebSocket server URL")
+	queue       := flag.String("queue",       "default",                       "Queue name to listen on")
+	apiKey      := flag.String("api-key",     "",                              "API key (Bearer token)")
+	concurrency := flag.Int("concurrency",    4,                               "Max concurrent jobs per connection")
+	connections := flag.Int("connections",    1,                               "Number of parallel WebSocket connections")
+	reconnDelay := flag.Duration("reconnect", 3*time.Second,                   "Reconnect delay on disconnect")
 	flag.Parse()
 
-	// 环境变量覆盖
-	if v := os.Getenv("QUEUE_SERVER"); v != "" {
-		*serverURL = v
-	}
-	if v := os.Getenv("QUEUE_NAME"); v != "" {
-		*queue = v
-	}
-	if v := os.Getenv("API_KEY"); v != "" {
-		*apiKey = v
-	}
+	// 注册 handlers
+	Register("send_email",       handleSendEmail)
+	Register("generate_report",  handleGenerateReport)
+	Register("resize_image",     handleResizeImage)
+	Register("data_sync",        handleDataSync)
+	Register("tag_task",         handleTagTask)         // v4: tags 示例
+	Register("batch_callback",   handleBatchCallback)   // v4: batch 回调示例
+	Register("on_success",       handleBatchCallback)   // batch then_job
+	Register("on_failure",       handleBatchCallback)   // batch catch_job
+	Register("on_finally",       handleBatchCallback)   // batch finally_job
 
-	log.Printf("=== GoWorker Starting ===")
-	log.Printf("  Server:      %s", *serverURL)
-	log.Printf("  Queue:       %s", *queue)
-	log.Printf("  Concurrency: %d jobs/connection", *concurrency)
-	log.Printf("  Connections: %d", *connections)
-	log.Printf("  Reconnect:   %v", *reconnDelay)
-	log.Printf("  Handlers:    %s", registeredHandlers())
+	log.Printf("[Worker] Handlers: %s", registeredHandlers())
+	log.Printf("[Worker] Queue=%s Concurrency=%d Connections=%d", *queue, *concurrency, *connections)
 
-	// 优雅关闭
+	// 信号处理
+	sigCh  := make(chan os.Signal, 1)
 	stopCh := make(chan struct{})
-	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	// 启动多个并行连接
 	var wg sync.WaitGroup
 	for i := 0; i < *connections; i++ {
 		wg.Add(1)
@@ -492,7 +348,6 @@ func main() {
 		}(i)
 	}
 
-	// 等待信号
 	sig := <-sigCh
 	log.Printf("[Worker] Received signal %v, shutting down...", sig)
 	close(stopCh)

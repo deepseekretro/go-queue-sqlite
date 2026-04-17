@@ -1,6 +1,6 @@
 # GoQueue 使用文档
 
-> 版本 1.0.0 · 基于 WebSocket 的轻量级任务队列系统
+> 版本 4.0.0 · 基于 WebSocket 的轻量级任务队列系统
 
 ---
 
@@ -23,6 +23,10 @@
    - 7.4 [批量任务（Batch）](#74-批量任务batch)
    - 7.5 [限流（Rate Limit）](#75-限流rate-limit)
    - 7.6 [动态扩缩容（AutoScale）](#76-动态扩缩容autoscale)
+   - 7.7 [任务标签（Tags）](#77-任务标签tags)  ⭐ v4
+   - 7.8 [Batch catch/finally 回调](#78-batch-catchfinally-回调)  ⭐ v4
+   - 7.9 [队列暂停与恢复（Pause/Resume）](#79-队列暂停与恢复pauseresume)  ⭐ v4
+   - 7.10 [定时任务（Cron）](#710-定时任务cron)  ⭐ v4
 8. [Dashboard 说明](#8-dashboard-说明)
 
 ---
@@ -130,7 +134,8 @@ X-API-Key: <your-api-key>
   "timeout_sec":  60,               // 任务超时秒数（传给 Worker，默认 60）
   "max_attempts": 3,                // 最大重试次数（传给 Worker）
   "backoff":      [10, 30, 60],     // 自定义重试延迟（秒），按次数依次使用
-  "next_job":     { ... }           // 任务链：本任务完成后自动投递的下一个任务
+  "next_job":     { ... },          // 任务链：本任务完成后自动投递的下一个任务
+  "tags":         ["urgent", "notify"]  // 任务标签（v4），可用于过滤和路由
 }
 ```
 
@@ -157,6 +162,7 @@ X-API-Key: <your-api-key>
 | `queue` | 按队列过滤 | `?queue=default` |
 | `status` | 按状态过滤（pending/running/done/failed） | `?status=pending` |
 | `limit` | 返回条数，默认 50 | `?limit=100` |
+| `tag` | 按标签过滤（v4） | `?tag=urgent` |
 
 **响应（200）：** Job 对象数组
 
@@ -165,10 +171,11 @@ X-API-Key: <your-api-key>
   {
     "id": 42,
     "queue": "default",
-    "payload": "{"job_type":"send_email","data":{...}}",
+    "payload": "{\"job_type\":\"send_email\",\"data\":{...}}",
     "attempts": 1,
     "status": "done",
     "priority": 5,
+    "tags": ["urgent", "notify"],
     "available_at": 1713340800,
     "started_at": 1713340801,
     "finished_at": 1713340802,
@@ -250,6 +257,153 @@ X-API-Key: <your-api-key>
 强制断开指定 Worker 的 WebSocket 连接，当前任务会被放回 `pending`。
 
 **响应（200）：** `{ "message": "worker kicked" }`
+
+---
+
+#### GET /api/tags — 获取所有任务标签  ⭐ v4
+
+返回数据库中所有已使用的任务标签列表。
+
+**响应（200）：**
+
+```json
+{ "tags": ["dry-run", "email", "notify", "urgent", "weekly"] }
+```
+
+---
+
+#### GET /api/batches — 查询批次列表  ⭐ v4（含 catch/finally）
+
+**响应（200）：** BatchStatus 数组
+
+```json
+[
+  {
+    "id": 1,
+    "name": "my-batch",
+    "total": 3,
+    "done": 2,
+    "failed": 0,
+    "pending": 1,
+    "status": "running",
+    "then_job":    "{\"queue\":\"default\",\"job_type\":\"on_success\",\"data\":{}}",
+    "catch_job":   "{\"queue\":\"default\",\"job_type\":\"on_failure\",\"data\":{}}",
+    "finally_job": "{\"queue\":\"default\",\"job_type\":\"on_finally\",\"data\":{}}",
+    "created_at": 1713340800
+  }
+]
+```
+
+---
+
+#### POST /api/batches — 创建批次（含 catch/finally）  ⭐ v4
+
+**请求体（JSON）：**
+
+```json
+{
+  "name": "my-batch",
+  "jobs": [
+    { "queue": "default", "job_type": "task_a", "data": {} },
+    { "queue": "default", "job_type": "task_b", "data": {} }
+  ],
+  "then_job":    { "queue": "notify", "job_type": "on_success", "data": {} },
+  "catch_job":   { "queue": "notify", "job_type": "on_failure", "data": {} },
+  "finally_job": { "queue": "notify", "job_type": "on_finally", "data": {} }
+}
+```
+
+| 回调字段 | 触发时机 |
+|---|---|
+| `then_job` | 批次内所有任务全部成功后触发 |
+| `catch_job` | 批次内有任意任务失败后触发 |
+| `finally_job` | 无论成功或失败，批次完成后必触发 |
+
+---
+
+#### GET /api/queues — 查询队列状态  ⭐ v4
+
+**响应（200）：**
+
+```json
+[{ "name": "default", "paused": false }]
+```
+
+---
+
+#### POST /api/queues/{queue}/pause — 暂停队列  ⭐ v4
+
+暂停后，该队列的 pending 任务不再派发给 Worker，直到恢复。
+
+**响应（200）：**
+
+```json
+{ "queue": "default", "paused": true }
+```
+
+---
+
+#### POST /api/queues/{queue}/resume — 恢复队列  ⭐ v4
+
+**响应（200）：**
+
+```json
+{ "queue": "default", "paused": false }
+```
+
+---
+
+#### GET /api/crons — 查询定时任务列表  ⭐ v4
+
+**响应（200）：** Cron 对象数组
+
+```json
+[
+  {
+    "id": 1,
+    "name": "hourly-report",
+    "every": "1h",
+    "queue": "default",
+    "job_type": "generate_report",
+    "data": {},
+    "next_run_at": 1713344400
+  }
+]
+```
+
+---
+
+#### POST /api/crons — 创建定时任务  ⭐ v4
+
+**请求体（JSON）：**
+
+```json
+{
+  "name":     "hourly-report",
+  "every":    "1h",
+  "queue":    "default",
+  "job_type": "generate_report",
+  "data":     { "name": "hourly" }
+}
+```
+
+`every` 支持的单位：`s`（秒）、`m`（分钟）、`h`（小时）、`d`（天）、`w`（周）。
+
+---
+
+#### PUT /api/crons/{id} — 更新定时任务  ⭐ v4
+
+请求体同 POST /api/crons。
+
+---
+
+#### DELETE /api/crons/{id} — 删除定时任务  ⭐ v4
+
+**响应（200）：**
+
+```json
+{ "message": "cron deleted" }
+```
 
 ---
 
@@ -376,13 +530,16 @@ ws://host:8080/ws/worker?queue=<队列名>
 
 ```json
 {
-  "type":    "job",
-  "job_id":  42,
-  "queue":   "default",
+  "type":     "job",
+  "job_id":   42,
+  "queue":    "default",
   "job_type": "send_email",
-  "payload": "{"job_type":"send_email","data":{"to":"user@example.com"},"timeout_sec":60}"
+  "payload":  "{\"job_type\":\"send_email\",\"data\":{\"to\":\"user@example.com\"},\"timeout_sec\":60}",
+  "tags":     ["urgent", "notify"]
 }
 ```
+
+> `tags` 字段为 v4 新增，Worker 可据此做路由或过滤处理。
 
 **result 消息（Worker → Server）：**
 
@@ -1016,6 +1173,111 @@ curl -X POST http://localhost:8080/api/autoscale \
 
 # 查看当前扩缩容池状态
 curl http://localhost:8080/api/autoscale
+```
+
+---
+
+### 7.7 任务标签（Tags）  ⭐ v4
+
+投递任务时可携带任意数量的字符串标签，用于过滤、路由或业务分类。
+
+```bash
+# 投递带标签的任务
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"queue":"default","job_type":"tag_task","data":{"message":"hello"},"tags":["urgent","notify"]}'
+
+# 按标签过滤任务列表
+curl http://localhost:8080/api/jobs?tag=urgent
+
+# 获取所有已使用的标签
+curl http://localhost:8080/api/tags
+```
+
+Worker 端接收到任务时，`tags` 字段会随 WebSocket job 消息一起下发，handler 可据此做差异化处理：
+
+```go
+// GoWorker 示例
+func handleTagTask(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+    for _, tag := range tags {
+        if tag == "dry-run" {
+            return "dry-run: skipped", nil
+        }
+    }
+    return "done", nil
+}
+```
+
+---
+
+### 7.8 Batch catch/finally 回调  ⭐ v4
+
+在创建批次时可指定三种回调任务：
+
+| 回调字段 | 触发时机 |
+|---|---|
+| `then_job` | 批次内所有任务全部成功后触发 |
+| `catch_job` | 批次内有任意任务失败后触发 |
+| `finally_job` | 无论成功或失败，批次完成后必触发 |
+
+```bash
+curl -X POST http://localhost:8080/api/batches \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "daily-pipeline",
+    "jobs": [
+      {"queue":"default","job_type":"fetch_data","data":{}},
+      {"queue":"default","job_type":"process_data","data":{}}
+    ],
+    "then_job":    {"queue":"notify","job_type":"on_success","data":{"msg":"pipeline ok"}},
+    "catch_job":   {"queue":"notify","job_type":"on_failure","data":{"msg":"pipeline failed"}},
+    "finally_job": {"queue":"notify","job_type":"on_finally","data":{"msg":"pipeline done"}}
+  }'
+```
+
+---
+
+### 7.9 队列暂停与恢复（Pause/Resume）  ⭐ v4
+
+暂停队列后，该队列的 pending 任务不再派发给 Worker，已在运行的任务不受影响。
+
+```bash
+# 暂停队列
+curl -X POST http://localhost:8080/api/queues/default/pause
+
+# 查看所有队列状态
+curl http://localhost:8080/api/queues
+# → [{"name":"default","paused":true}]
+
+# 恢复队列
+curl -X POST http://localhost:8080/api/queues/default/resume
+```
+
+---
+
+### 7.10 定时任务（Cron）  ⭐ v4
+
+内置轻量级 Cron 调度器，按固定间隔自动投递任务，无需外部 crontab。
+
+```bash
+# 创建定时任务（每小时生成报告）
+curl -X POST http://localhost:8080/api/crons \
+  -H "Content-Type: application/json" \
+  -d '{"name":"hourly-report","every":"1h","queue":"default","job_type":"generate_report","data":{"name":"hourly"}}'
+
+# 支持的时间单位：s（秒）、m（分钟）、h（小时）、d（天）、w（周）
+# 示例：30s / 5m / 2h / 1d / 1w
+
+# 查询所有定时任务
+curl http://localhost:8080/api/crons
+
+# 更新定时任务
+curl -X PUT http://localhost:8080/api/crons/1 \
+  -H "Content-Type: application/json" \
+  -d '{"name":"hourly-report","every":"2h","queue":"default","job_type":"generate_report","data":{}}'
+
+# 删除定时任务
+curl -X DELETE http://localhost:8080/api/crons/1
 ```
 
 ---

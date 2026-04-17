@@ -459,6 +459,11 @@ func startWsDispatcher(queue string) {
 				return
 			default:
 			}
+			// P3-A: 队列暂停时跳过派发
+			if isQueuePaused(queue) {
+				time.Sleep(500 * time.Millisecond)
+				continue
+			}
 			if hub.countForQueue(queue) == 0 {
 				time.Sleep(500 * time.Millisecond)
 				continue
@@ -869,6 +874,7 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 		MaxAttempts int             `json:"max_attempts"`
 		NextJob      *ChainedJob     `json:"next_job,omitempty"` // P2-3: 任务链
 		Backoff      []int           `json:"backoff,omitempty"`  // P3-1: 自定义重试延迟
+		Tags         []string        `json:"tags,omitempty"`     // P4: 任务标签
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		if strings.Contains(err.Error(), "http: request body too large") {
@@ -919,6 +925,10 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if req.NextJob != nil {
 		nextJobBytes, _ := json.Marshal(req.NextJob)
 		db.Exec(`UPDATE jobs SET next_job=? WHERE id=?`, string(nextJobBytes), id)
+	}
+	// P4: 写入 tags
+	if len(req.Tags) > 0 {
+		dispatchJobWithTags(id, req.Tags)
 	}
 	jsonResp(w, 201, map[string]interface{}{"job_id": id, "queue": req.Queue, "status": "pending"})
 }
@@ -980,7 +990,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow(`SELECT COUNT(*) FROM failed_jobs`).Scan(&failed)
 	stats["failed_jobs_table"] = failed
 	stats["ws_workers"] = hub.count()
-	stats["version"] = "1.0.0"
+	stats["version"] = "4.0.0"
 	stats["queues"] = []string{"default", "emails"}
 
 	// 平均耗时：只统计 finished_at > 0 且 started_at > 0 的已完成任务
@@ -1187,7 +1197,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"db":         dbStatus,
 		"uptime_sec": uptime,
 		"ws_workers": hub.count(),
-		"version":    "1.0.0",
+		"version":    "4.0.0",
 	})
 }
 
@@ -1216,6 +1226,9 @@ func main() {
 	initLogger()
 	initDB()
 	initBatchDB()
+	initCronDB()
+	startCronScheduler()
+	initTagsDB()
 
 	startStaleJobReaper()
 	startHeartbeatReaper()
@@ -1268,7 +1281,7 @@ func main() {
 		if r.Method == http.MethodPost {
 			handleDispatch(w, r)
 		} else {
-			handleListJobs(w, r)
+			handleListJobsWithTags(w, r)
 		}
 	})))
 	// /api/jobs/:id — DELETE to cancel a pending job
@@ -1300,6 +1313,11 @@ func main() {
 		}
 	})))
 	mux.HandleFunc("/api/batches/", cors(auth(handleBatchStatus)))
+	mux.HandleFunc("/api/queues", cors(auth(handleQueueList)))
+	mux.HandleFunc("/api/queues/", cors(auth(handleQueuePauseResume)))
+	mux.HandleFunc("/api/crons", cors(auth(handleCrons)))
+	mux.HandleFunc("/api/crons/", cors(auth(handleCronItem)))
+	mux.HandleFunc("/api/tags", cors(auth(handleGetTags)))
 	mux.HandleFunc("/api/backend", cors(auth(handleBackendInfo)))    // P3-2: 后端信息
 	mux.HandleFunc("/api/autoscale", cors(auth(handleAutoScale)))    // P3-3: 动态扩缩容
 	mux.HandleFunc("/api/stats", cors(auth(handleStats)))

@@ -306,14 +306,18 @@ const indexHTML = `<!DOCTYPE html>
         <label>Limit</label>
         <input type="number" id="f-limit" value="30" style="width:80px" onchange="loadJobs()">
       </div>
+      <div>
+        <label>Tag</label>
+        <input type="text" id="f-tag" placeholder="filter by tag…" style="width:110px" oninput="loadJobs()">
+      </div>
     </div>
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>ID</th><th>Queue</th><th>Job Type</th><th>Status</th><th>Attempts</th><th>Payload</th><th>Created</th><th>Updated</th></tr>
+          <tr><th>ID</th><th>Queue</th><th>Job Type</th><th>Status</th><th>Attempts</th><th>Tags</th><th>Payload</th><th>Created</th><th>Updated</th></tr>
         </thead>
         <tbody id="jobs-tbody">
-          <tr><td colspan="8" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
+          <tr><td colspan="9" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
         </tbody>
       </table>
     </div>
@@ -794,29 +798,35 @@ function statusBadge(s) {
 async function loadJobs() {
   const queue  = document.getElementById('f-queue').value;
   const status = document.getElementById('f-status').value;
+  const tag    = document.getElementById('f-tag') ? document.getElementById('f-tag').value : '';
   const limit  = document.getElementById('f-limit').value || 30;
   let url = ` + "`" + `/api/jobs?limit=${limit}` + "`" + `;
   if (queue)  url += ` + "`" + `&queue=${queue}` + "`" + `;
   if (status) url += ` + "`" + `&status=${status}` + "`" + `;
+  if (tag)    url += ` + "`" + `&tag=${encodeURIComponent(tag)}` + "`" + `;
 
   const res = await fetch(url);
   const jobs = await res.json();
   const tbody = document.getElementById('jobs-tbody');
 
   if (!jobs || jobs.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#64748b;padding:24px">No jobs found</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748b;padding:24px">No jobs found</td></tr>';
     return;
   }
 
   tbody.innerHTML = jobs.map(j => {
     const jt = jobTypeBadge(j.payload);
     const payloadShort = j.payload.length > 80 ? j.payload.slice(0,80)+'…' : j.payload;
+    const tagsHtml = (j.tags && j.tags.length > 0)
+      ? j.tags.map(t => ` + "`" + `<span style="display:inline-block;padding:1px 6px;border-radius:10px;font-size:0.68rem;background:#1e3a5f;color:#93c5fd;border:1px solid #3b82f6;margin:1px;cursor:pointer" onclick="document.getElementById('f-tag').value='${escHtml(t)}';loadJobs()">${escHtml(t)}</span>` + "`" + `).join('')
+      : '<span style="color:#475569">&mdash;</span>';
     return ` + "`" + `<tr>
       <td style="color:#a78bfa;font-weight:600">#${j.id}</td>
       <td><code style="color:#fbbf24">${j.queue}</code></td>
       <td><code style="color:#93c5fd">${jt}</code></td>
       <td>${statusBadge(j.status)}</td>
       <td style="text-align:center">${j.attempts}</td>
+      <td>${tagsHtml}</td>
       <td class="payload-cell" title="${j.payload.replace(/"/g,'&quot;')}">${payloadShort}</td>
       <td class="ts">${fmtTime(j.created_at)}</td>
       <td class="ts">${fmtTime(j.updated_at)}</td>

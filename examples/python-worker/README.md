@@ -1,6 +1,6 @@
-# GoQueue Python Worker 示例
+# GoQueue Python Worker
 
-Python 实现的 GoQueue WebSocket Worker，含心跳、自动重连、多 handler 注册。
+适用于 Python 3.8+ 环境的 GoQueue Worker 示例。
 
 ## 快速开始
 
@@ -13,49 +13,86 @@ python worker.py
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `GOQUEUE_SERVER` | `ws://localhost:8080/ws/worker` | 服务端 WebSocket 地址 |
+| `GOQUEUE_SERVER` | `ws://localhost:8080/ws/worker` | WebSocket 服务端地址 |
 | `GOQUEUE_QUEUE` | `default` | 监听的队列名 |
 | `GOQUEUE_API_KEY` | _(空)_ | API Key |
+| `GOQUEUE_CONCURRENCY` | `4` | 最大并发任务数 |
 
-```bash
-GOQUEUE_SERVER=ws://my-server:8080/ws/worker GOQUEUE_QUEUE=emails python worker.py
-```
-
-## 注册自定义 Handler
+## 添加 Handler
 
 ```python
-def handle_my_job(data: dict) -> str:
-    # data 是任务的 data 字段（已解析为 dict）
-    # 返回字符串 → 成功日志
-    # 抛出异常 → 任务失败
-    name = data.get("name", "")
-    return f"processed: {name}"
+# handler 签名：(data: dict, tags: list[str]) -> str
+# data: payload 字典，tags: 任务标签列表（v4 新增）
+def handle_my_job(data: dict, tags: list) -> str:
+    if "dry-run" in tags:
+        return "dry-run: skipped"
+    # 正常处理...
+    return "done"
 
 worker.register("my_job", handle_my_job)
 ```
 
-## 心跳机制
+## 新特性（v4）
 
-- 连接成功后启动后台心跳线程，每 20 秒发送 `{"type":"ping"}`
-- 服务端回复 `{"type":"pong"}`，静默处理
-- 连接断开后自动重连（默认 3 秒后）
-
-## 后台线程模式
-
-```python
-worker = GoQueueWorker()
-worker.register("send_email", handle_send_email)
-t = worker.start()   # 非阻塞，返回线程对象
-# ... 主线程做其他事 ...
-worker.stop()        # 停止 Worker
-```
-
-## 投递任务
+### 任务标签（Tags）
 
 ```bash
+# 投递带标签的任务
 curl -X POST http://localhost:8080/api/jobs \
   -H "Content-Type: application/json" \
-  -d '{"queue":"default","job_type":"send_email","data":{"to":"user@example.com","subject":"Hello"}}'
+  -d '{"queue":"default","job_type":"tag_task","data":{"message":"hello"},"tags":["urgent","notify"]}'
+
+# 按标签过滤
+curl http://localhost:8080/api/jobs?tag=urgent
+
+# 获取所有标签
+curl http://localhost:8080/api/tags
 ```
 
-详细文档：[../../doc/README.md](../../doc/README.md)
+### Batch catch/finally 回调
+
+```bash
+curl -X POST http://localhost:8080/api/batches \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-batch",
+    "jobs": [{"queue":"default","job_type":"send_email","data":{"to":"a@b.com"}}],
+    "then_job":    {"queue":"default","job_type":"on_success","data":{}},
+    "catch_job":   {"queue":"default","job_type":"on_failure","data":{}},
+    "finally_job": {"queue":"default","job_type":"on_finally","data":{}}
+  }'
+```
+
+| 回调 | 触发时机 |
+|---|---|
+| `then_job` | 所有任务全部成功 |
+| `catch_job` | 有任意任务失败 |
+| `finally_job` | 无论成功或失败，批次完成后必触发 |
+
+### Queue Pause/Resume
+
+```bash
+curl -X POST http://localhost:8080/api/queues/default/pause
+curl -X POST http://localhost:8080/api/queues/default/resume
+curl http://localhost:8080/api/queues
+```
+
+### Cron 调度器
+
+```bash
+# 支持 s/m/h/d/w 单位
+curl -X POST http://localhost:8080/api/crons \
+  -H "Content-Type: application/json" \
+  -d '{"name":"hourly","every":"1h","queue":"default","job_type":"generate_report","data":{}}'
+```
+
+## 内置 Handler 列表
+
+| job_type | 说明 |
+|---|---|
+| `send_email` | 发送邮件示例 |
+| `generate_report` | 生成报告示例 |
+| `resize_image` | 图片缩放示例 |
+| `data_sync` | 数据同步示例 |
+| `tag_task` | 按 tags 路由处理示例（v4） |
+| `on_success` / `on_failure` / `on_finally` | Batch 回调示例（v4） |

@@ -5,9 +5,15 @@ GoQueue Python Worker 示例
 启动：python worker.py
 
 环境变量：
-  GOQUEUE_SERVER   WebSocket 服务端地址，默认 ws://localhost:8080/ws/worker
-  GOQUEUE_QUEUE    监听的队列名，默认 default
-  GOQUEUE_API_KEY  API Key（对应服务端 API_KEY 环境变量）
+  GOQUEUE_SERVER        WebSocket 服务端地址，默认 ws://localhost:8080/ws/worker
+  GOQUEUE_QUEUE         监听的队列名，默认 default
+  GOQUEUE_API_KEY       API Key（对应服务端 API_KEY 环境变量）
+  GOQUEUE_CONCURRENCY   最大并发任务数，默认 4
+
+新特性（v4）：
+  - tags：任务可携带标签，handler 第二参数接收 tags 列表
+  - batch catch/finally：批次失败/完成回调
+  - queue pause/resume：队列可暂停，暂停期间任务不派发
 """
 
 import json
@@ -15,7 +21,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import websocket
 
@@ -26,83 +32,53 @@ logging.basicConfig(
 log = logging.getLogger("goqueue-worker")
 
 # ─── 配置 ─────────────────────────────────────────────────────────────────────
-SERVER_URL    = os.getenv("GOQUEUE_SERVER",  "ws://localhost:8080/ws/worker")
-QUEUE         = os.getenv("GOQUEUE_QUEUE",   "default")
-API_KEY       = os.getenv("GOQUEUE_API_KEY", "")
-PING_INTERVAL = 20   # 心跳间隔（秒）
-RECONNECT_DELAY = 3  # 断线重连间隔（秒）
+SERVER_URL    = os.getenv("GOQUEUE_SERVER",      "ws://localhost:8080/ws/worker")
+QUEUE         = os.getenv("GOQUEUE_QUEUE",       "default")
+API_KEY       = os.getenv("GOQUEUE_API_KEY",     "")
+CONCURRENCY   = int(os.getenv("GOQUEUE_CONCURRENCY", "4"))
+PING_INTERVAL = 20      # 心跳间隔（秒）
+RECONNECT_DELAY = 3.0   # 断线重连间隔（秒）
 
+# ─── Handler 类型 ──────────────────────────────────────────────────────────────
+# handler 签名：(data: dict, tags: list[str]) -> str
+# data: 解析后的 payload 字典
+# tags: 任务标签列表（v4 新增），例如 ["urgent", "notify"]
+HandlerFunc = Callable[[Dict[str, Any], List[str]], str]
 
-# ─── GoQueueWorker ────────────────────────────────────────────────────────────
-
+# ─── GoQueueWorker ─────────────────────────────────────────────────────────────
 class GoQueueWorker:
-    """
-    GoQueue WebSocket Worker
-
-    用法：
-        worker = GoQueueWorker()
-        worker.register("send_email", handle_send_email)
-        worker.run()          # 阻塞；或 worker.start() 后台线程
-    """
-
-    def __init__(
-        self,
-        server_url: str = SERVER_URL,
-        queue: str = QUEUE,
-        api_key: str = API_KEY,
-        ping_interval: int = PING_INTERVAL,
-        reconnect_delay: int = RECONNECT_DELAY,
-    ):
-        self.server_url     = server_url
-        self.queue          = queue
-        self.api_key        = api_key
-        self.ping_interval  = ping_interval
-        self.reconnect_delay = reconnect_delay
-        self._handlers: Dict[str, Callable] = {}
+    def __init__(self):
+        self._handlers: Dict[str, HandlerFunc] = {}
         self._ws: Optional[websocket.WebSocketApp] = None
-        self._stop_event = threading.Event()
+        self._stopped = False
+        self._sem = threading.Semaphore(CONCURRENCY)
 
-    def register(self, job_type: str, handler: Callable[[Dict[str, Any]], str]) -> None:
-        """
-        注册任务处理器。
-
-        handler 签名：def handler(data: dict) -> str
-          - data：任务的 data 字段（已解析为 dict）
-          - 返回值：成功日志字符串
-          - 抛出异常：任务标记为失败，异常信息作为 error
-        """
+    def register(self, job_type: str, handler: HandlerFunc):
+        """注册 job_type 对应的处理函数"""
         self._handlers[job_type] = handler
         log.info(f"Registered handler: {job_type}")
 
-    def run(self) -> None:
-        """阻塞运行，自动重连。"""
-        while not self._stop_event.is_set():
+    def run(self):
+        """启动 Worker（阻塞，自动重连）"""
+        while not self._stopped:
             self._connect()
-            if not self._stop_event.is_set():
-                log.info(f"Reconnecting in {self.reconnect_delay}s...")
-                time.sleep(self.reconnect_delay)
+            if not self._stopped:
+                log.info(f"Reconnecting in {RECONNECT_DELAY}s...")
+                time.sleep(RECONNECT_DELAY)
 
-    def start(self) -> threading.Thread:
-        """在后台线程中运行，返回线程对象。"""
-        t = threading.Thread(target=self.run, daemon=True)
-        t.start()
-        return t
-
-    def stop(self) -> None:
-        """停止 Worker。"""
-        self._stop_event.set()
+    def stop(self):
+        self._stopped = True
         if self._ws:
             self._ws.close()
 
-    # ── 内部方法 ──────────────────────────────────────────────────────────────
-
-    def _connect(self) -> None:
-        url = f"{self.server_url}?queue={self.queue}"
+    def _connect(self):
+        url = f"{SERVER_URL}?queue={QUEUE}"
         headers = {}
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
+        if API_KEY:
+            headers["Authorization"] = f"Bearer {API_KEY}"
 
-        log.info(f"Connecting to {url}")
+        log.info(f"Connecting to {url} ...")
+
         self._ws = websocket.WebSocketApp(
             url,
             header=headers,
@@ -111,123 +87,145 @@ class GoQueueWorker:
             on_error=self._on_error,
             on_close=self._on_close,
         )
-        self._ws.run_forever()
+        self._ws.run_forever(ping_interval=PING_INTERVAL, ping_timeout=10)
 
-    def _on_open(self, ws) -> None:
-        log.info(f"Connected, queue={self.queue}")
-        # 启动心跳线程：每 ping_interval 秒发送一次 JSON ping
-        t = threading.Thread(target=self._heartbeat_loop, args=(ws,), daemon=True)
-        t.start()
+    def _on_open(self, ws):
+        log.info("Connected ✓")
 
-    def _heartbeat_loop(self, ws) -> None:
-        """心跳线程：每 ping_interval 秒发送 {"type":"ping"}"""
-        while not self._stop_event.is_set():
-            time.sleep(self.ping_interval)
-            try:
-                if ws.sock and ws.sock.connected:
-                    ws.send(json.dumps({"type": "ping"}))
-                    log.debug("Sent ping")
-                else:
-                    break
-            except Exception as e:
-                log.warning(f"Ping failed: {e}")
-                break
-
-    def _on_message(self, ws, raw: str) -> None:
+    def _on_message(self, ws, raw: str):
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError:
-            log.warning(f"Invalid JSON: {raw}")
             return
 
         msg_type = msg.get("type")
-
         if msg_type == "connected":
             log.info(f"Server: {msg.get('message')}")
-        elif msg_type == "pong":
-            log.debug("Received pong")   # 心跳响应，静默处理
+        elif msg_type == "job":
+            # 并发控制
+            if not self._sem.acquire(blocking=False):
+                log.warning(f"[Job #{msg.get('job_id')}] Worker busy, rejecting")
+                self._send_result(ws, msg["job_id"], False, error="worker busy")
+                return
+            t = threading.Thread(target=self._handle_job, args=(ws, msg), daemon=True)
+            t.start()
         elif msg_type == "ack":
             log.info(f"ACK: {msg.get('message')}")
-        elif msg_type == "job":
-            self._handle_job(ws, msg)
         else:
             log.debug(f"Unknown message type: {msg_type}")
 
-    def _handle_job(self, ws, msg: dict) -> None:
-        job_id   = msg["job_id"]
-        job_type = msg["job_type"]
+    def _on_error(self, ws, error):
+        log.error(f"WS error: {error}")
 
+    def _on_close(self, ws, code, reason):
+        log.info(f"Disconnected (code={code} reason={reason})")
+
+    def _handle_job(self, ws, msg: dict):
         try:
-            payload = json.loads(msg["payload"])
-            data    = payload.get("data", {})
-        except (json.JSONDecodeError, KeyError) as e:
-            self._send_result(ws, job_id, success=False, error=f"Invalid payload: {e}")
-            return
+            job_id   = msg["job_id"]
+            job_type = msg.get("job_type", "")
+            queue    = msg.get("queue", "")
+            payload  = msg.get("payload", "{}")
+            tags     = msg.get("tags") or []   # v4: 任务标签
 
-        log.info(f"Job #{job_id} type={job_type} queue={msg.get('queue')}")
+            log.info(f"[Job #{job_id}] type={job_type} queue={queue} tags={tags}")
 
-        handler = self._handlers.get(job_type)
-        if not handler:
-            self._send_result(ws, job_id, success=False,
-                              error=f"No handler for job_type: {job_type!r}")
-            return
+            # 解析 payload
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError as e:
+                self._send_result(ws, job_id, False, error=f"payload parse error: {e}")
+                return
 
-        try:
-            result_log = handler(data)
-            log.info(f"Job #{job_id} done: {result_log}")
-            self._send_result(ws, job_id, success=True, log=result_log or "done")
+            # 查找 handler
+            handler = self._handlers.get(job_type)
+            if not handler:
+                log.warning(f"[Job #{job_id}] No handler for job_type={job_type}")
+                self._send_result(ws, job_id, False, error=f"no handler for job_type: {job_type}")
+                return
+
+            # 执行
+            result = handler(data, tags)
+            log.info(f"[Job #{job_id}] OK: {result}")
+            self._send_result(ws, job_id, True, log_msg=result)
+
         except Exception as e:
-            log.error(f"Job #{job_id} failed: {e}")
-            self._send_result(ws, job_id, success=False, error=str(e))
+            log.exception(f"[Job #{msg.get('job_id')}] FAILED: {e}")
+            self._send_result(ws, msg.get("job_id"), False, error=str(e))
+        finally:
+            self._sem.release()
 
-    def _send_result(self, ws, job_id: int, *, success: bool,
-                     log: str = "", error: str = "") -> None:
-        msg: Dict[str, Any] = {"type": "result", "job_id": job_id, "success": success}
+    def _send_result(self, ws, job_id: int, success: bool,
+                     log_msg: str = "", error: str = ""):
+        msg = {"type": "result", "job_id": job_id, "success": success}
         if success:
-            msg["log"]   = log
+            msg["log"] = log_msg
         else:
             msg["error"] = error
-        ws.send(json.dumps(msg))
-
-    def _on_error(self, ws, error) -> None:
-        log.error(f"WebSocket error: {error}")
-
-    def _on_close(self, ws, close_status_code, close_msg) -> None:
-        log.info(f"Disconnected (code={close_status_code}, msg={close_msg})")
+        try:
+            ws.send(json.dumps(msg))
+        except Exception as e:
+            log.error(f"Failed to send result: {e}")
 
 
-# ─── Job Handlers ─────────────────────────────────────────────────────────────
+# ─── 示例 Job Handlers ─────────────────────────────────────────────────────────
 
-def handle_send_email(data: dict) -> str:
-    to      = data.get("to", "unknown")
+def handle_send_email(data: dict, tags: list) -> str:
+    to      = data.get("to", "")
     subject = data.get("subject", "")
-    log.info(f"Sending email to {to}: {subject}")
-    time.sleep(0.3)   # 模拟耗时
+    log.info(f"[send_email] to={to} subject={subject} tags={tags}")
+    time.sleep(0.3)
     return f"Email sent to {to}"
 
 
-def handle_generate_report(data: dict) -> str:
-    name = data.get("name", "unknown")
-    log.info(f"Generating report: {name}")
+def handle_generate_report(data: dict, tags: list) -> str:
+    name = data.get("name", "")
+    log.info(f"[generate_report] name={name} tags={tags}")
     time.sleep(0.8)
-    return f"Report \"{name}\" generated"
+    return f"Report '{name}' generated"
 
 
-def handle_resize_image(data: dict) -> str:
+def handle_resize_image(data: dict, tags: list) -> str:
     url = data.get("url", "")
-    w   = data.get("width",  800)
-    h   = data.get("height", 600)
-    log.info(f"Resizing {url} to {w}x{h}")
+    w   = data.get("width", 0)
+    h   = data.get("height", 0)
+    log.info(f"[resize_image] url={url} size={w}x{h} tags={tags}")
     time.sleep(0.5)
     return f"Image {url} resized to {w}x{h}"
 
 
-def handle_data_sync(data: dict) -> str:
+def handle_data_sync(data: dict, tags: list) -> str:
     src = data.get("source", "")
     dst = data.get("target", "")
-    log.info(f"Syncing {src} → {dst}")
+    log.info(f"[data_sync] {src} → {dst} tags={tags}")
     time.sleep(0.6)
     return f"Synced {src} → {dst}"
+
+
+def handle_tag_task(data: dict, tags: list) -> str:
+    """v4: 演示如何根据 tags 做不同处理"""
+    message = data.get("message", "")
+    log.info(f"[tag_task] message={message} tags={tags}")
+
+    if "dry-run" in tags:
+        log.info("[tag_task] dry-run 模式，跳过实际操作")
+        return "dry-run: skipped"
+    if "urgent" in tags:
+        log.info("[tag_task] 紧急任务，优先处理")
+    if "notify" in tags:
+        log.info("[tag_task] 需要发送通知")
+
+    time.sleep(0.2)
+    return f"tag_task done: {message} (tags={tags})"
+
+
+def handle_batch_callback(data: dict, tags: list) -> str:
+    """v4: 处理 batch 的 then/catch/finally 回调"""
+    batch_id = data.get("batch_id", "")
+    status   = data.get("status", "")
+    log.info(f"[batch_callback] batch_id={batch_id} status={status} tags={tags}")
+    # 在这里可以发送通知、更新数据库等
+    return f"batch {batch_id} callback handled (status={status})"
 
 
 # ─── 入口 ─────────────────────────────────────────────────────────────────────
@@ -235,12 +233,22 @@ def handle_data_sync(data: dict) -> str:
 if __name__ == "__main__":
     worker = GoQueueWorker()
 
+    # 基础 handlers
     worker.register("send_email",      handle_send_email)
     worker.register("generate_report", handle_generate_report)
     worker.register("resize_image",    handle_resize_image)
     worker.register("data_sync",       handle_data_sync)
 
-    log.info("GoQueue Python Worker starting... (Ctrl+C to stop)")
+    # v4: tags 示例
+    worker.register("tag_task",        handle_tag_task)
+
+    # v4: batch 回调示例
+    worker.register("batch_callback",  handle_batch_callback)
+    worker.register("on_success",      handle_batch_callback)   # batch then_job
+    worker.register("on_failure",      handle_batch_callback)   # batch catch_job
+    worker.register("on_finally",      handle_batch_callback)   # batch finally_job
+
+    log.info(f"GoQueue Python Worker starting... Queue={QUEUE} Concurrency={CONCURRENCY} (Ctrl+C to stop)")
     try:
         worker.run()
     except KeyboardInterrupt:

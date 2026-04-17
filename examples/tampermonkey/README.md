@@ -114,3 +114,77 @@ curl -X POST http://localhost:8080/api/jobs \
 - 建议在专用标签页（如 Dashboard 页面）中运行
 
 详细文档：[../../doc/README.md](../../doc/README.md)
+
+## 新特性（v4）
+
+### 任务标签（Tags）
+
+投递任务时可携带标签，面板日志中会显示 tags 信息，handler 第二参数接收 tags 数组：
+
+```bash
+# 投递带标签的任务
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"queue":"default","job_type":"tag_task","data":{"message":"hello"},"tags":["urgent","dry-run"]}'
+
+# 按标签过滤任务列表
+curl http://localhost:8080/api/jobs?tag=urgent
+
+# 获取所有已使用的标签
+curl http://localhost:8080/api/tags
+```
+
+内置 `tag_task` handler 演示了如何根据 tags 做不同处理（`dry-run` 跳过、`urgent` 优先等）。
+
+### Batch catch/finally 回调
+
+```bash
+curl -X POST http://localhost:8080/api/batches \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-batch",
+    "jobs": [{"queue":"default","job_type":"fetch_url","data":{"url":"https://example.com"}}],
+    "then_job":    {"queue":"default","job_type":"on_success","data":{}},
+    "catch_job":   {"queue":"default","job_type":"on_failure","data":{}},
+    "finally_job": {"queue":"default","job_type":"on_finally","data":{}}
+  }'
+```
+
+| 回调 | 触发时机 |
+|---|---|
+| `then_job` | 所有任务全部成功 |
+| `catch_job` | 有任意任务失败 |
+| `finally_job` | 无论成功或失败，批次完成后必触发 |
+
+### Queue Pause/Resume
+
+```bash
+curl -X POST http://localhost:8080/api/queues/default/pause
+curl -X POST http://localhost:8080/api/queues/default/resume
+curl http://localhost:8080/api/queues
+```
+
+### Cron 调度器
+
+```bash
+# 支持 s/m/h/d/w 单位
+curl -X POST http://localhost:8080/api/crons \
+  -H "Content-Type: application/json" \
+  -d '{"name":"hourly","every":"1h","queue":"default","job_type":"fetch_url","data":{"url":"https://example.com"}}'
+
+# 列出 / 更新 / 删除
+curl http://localhost:8080/api/crons
+curl -X PUT    http://localhost:8080/api/crons/1 -H "Content-Type: application/json" -d '{"name":"hourly","every":"2h","queue":"default","job_type":"fetch_url","data":{}}'
+curl -X DELETE http://localhost:8080/api/crons/1
+```
+
+## 内置 Handler 列表
+
+| job_type | 说明 |
+|---|---|
+| `fetch_url` | 抓取网页内容 |
+| `delay` | 延迟执行 |
+| `local_storage_set` | 写入 localStorage |
+| `click_element` | 点击页面元素 |
+| `tag_task` | 按 tags 路由处理示例（v4） |
+| `on_success` / `on_failure` / `on_finally` | Batch 回调示例（v4） |

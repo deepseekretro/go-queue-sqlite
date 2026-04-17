@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         GoQueue Worker Panel
 // @namespace    https://github.com/deepseekretro/go-queue-sqlite
-// @version      3.0.0
-// @description  在页面右上角显示 GoQueue Worker 控制面板，实时展示连接状态与任务日志
+// @version      4.0.0
+// @description  在页面右上角显示 GoQueue Worker 控制面板，实时展示连接状态与任务日志（v4: tags/batch catch-finally/cron/queue pause）
 // @author       GoQueue
 // @match        *://*/*
 // @grant        GM_getValue
@@ -432,6 +432,38 @@
       el.click();
       return `Clicked: ${data.selector}`;
     },
+
+    // v4: 按 tags 路由处理示例
+    // 投递：{"queue":"default","job_type":"tag_task","data":{"message":"hello"},"tags":["urgent","dry-run"]}
+    tag_task: async (data, tags) => {
+      if (tags.includes('dry-run')) {
+        addLog('[tag_task] dry-run 模式，跳过实际操作', 'warn');
+        return 'dry-run: skipped';
+      }
+      if (tags.includes('urgent')) {
+        addLog('[tag_task] 紧急任务', 'warn');
+      }
+      await sleep(200);
+      return `tag_task done: ${data.message} (tags=${JSON.stringify(tags)})`;
+    },
+
+    // v4: batch then_job 回调（所有任务成功时触发）
+    on_success: async (data, tags) => {
+      addLog(`[on_success] batch_id=${data.batch_id}`, 'success');
+      return `batch ${data.batch_id} succeeded`;
+    },
+
+    // v4: batch catch_job 回调（有任务失败时触发）
+    on_failure: async (data, tags) => {
+      addLog(`[on_failure] batch_id=${data.batch_id}`, 'error');
+      return `batch ${data.batch_id} failed`;
+    },
+
+    // v4: batch finally_job 回调（无论成功失败，批次完成后必触发）
+    on_finally: async (data, tags) => {
+      addLog(`[on_finally] batch_id=${data.batch_id}`, 'info');
+      return `batch ${data.batch_id} finished`;
+    },
   };
 
   // ─── Worker 核心 ──────────────────────────────────────────────────────────
@@ -517,6 +549,7 @@
   async function handleJob(msg) {
     const jobId   = msg.job_id;
     const jobType = msg.job_type;
+    const tags    = msg.tags || [];   // v4: 任务标签
     const cfg     = getCfg();
 
     let payload, data;
@@ -527,7 +560,7 @@
       return sendResult(jobId, false, '', `Invalid payload: ${e.message}`);
     }
 
-    addLog(`Job #${jobId} [${jobType}]`, 'job');
+    addLog(`Job #${jobId} [${jobType}]${tags.length ? ' tags=' + JSON.stringify(tags) : ''}`, 'job');
     setDot('working', `处理中 #${jobId}`);
 
     const handler = handlers[jobType];
@@ -540,7 +573,7 @@
     }
 
     try {
-      const result = await handler(data);
+      const result = await handler(data, tags);   // v4: 传递 tags
       jobCount++;
       updateBadges();
       setDot('connected', `已连接 · ${cfg.queue}`);

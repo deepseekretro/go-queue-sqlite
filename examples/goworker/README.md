@@ -9,7 +9,7 @@
 go build -o goworker .
 
 # 启动（确保 goapp 已在 localhost:8080 运行）
-./goworker -server ws://localhost:8080/ws/worker -queue default -concurrency 2
+./goworker -server ws://localhost:8080/ws/worker -queue default -concurrency 4
 ```
 
 ## 启动参数
@@ -18,58 +18,111 @@ go build -o goworker .
 |---|---|---|
 | `-server` | `ws://localhost:8080/ws/worker` | 服务端 WebSocket 地址 |
 | `-queue` | `default` | 监听的队列名 |
-| `-api-key` | _(空)_ | API Key（对应服务端 `API_KEY` 环境变量） |
-| `-concurrency` | `1` | 每个连接的并发任务数 |
+| `-api-key` | _(空)_ | API Key（Bearer Token） |
+| `-concurrency` | `4` | 单连接最大并发任务数 |
 | `-connections` | `1` | 并行 WebSocket 连接数 |
 | `-reconnect` | `3s` | 断线重连间隔 |
 
-环境变量覆盖：`QUEUE_SERVER`、`QUEUE_NAME`、`API_KEY`
+## 注册 Handler
 
-## 内置 Job Handlers
+```go
+// 函数签名：data 是 payload，tags 是任务标签（v4 新增）
+Register("my_job", func(ctx context.Context, data map[string]interface{}, tags []string) (string, error) {
+    // 根据 tags 做不同处理
+    for _, tag := range tags {
+        if tag == "dry-run" {
+            return "dry-run: skipped", nil
+        }
+    }
+    // 正常处理...
+    return "done", nil
+})
+```
+
+## 新特性（v4）
+
+### 任务标签（Tags）
+
+投递任务时可携带标签，Worker 收到任务后可按标签路由或过滤：
+
+```bash
+# 投递带标签的任务
+curl -X POST http://localhost:8080/api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"queue":"default","job_type":"tag_task","data":{"message":"hello"},"tags":["urgent","notify"]}'
+
+# 按标签过滤任务列表
+curl http://localhost:8080/api/jobs?tag=urgent
+
+# 获取所有已使用的标签
+curl http://localhost:8080/api/tags
+```
+
+### Batch catch/finally 回调
+
+批次任务支持三路回调：
+
+```bash
+curl -X POST http://localhost:8080/api/batches \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-batch",
+    "jobs": [
+      {"queue":"default","job_type":"task_a","data":{}},
+      {"queue":"default","job_type":"task_b","data":{}}
+    ],
+    "then_job":    {"queue":"notify","job_type":"on_success","data":{}},
+    "catch_job":   {"queue":"notify","job_type":"on_failure","data":{}},
+    "finally_job": {"queue":"notify","job_type":"on_finally","data":{}}
+  }'
+```
+
+| 回调 | 触发时机 |
+|---|---|
+| `then_job` | 所有任务全部成功 |
+| `catch_job` | 有任意任务失败 |
+| `finally_job` | 无论成功或失败，批次完成后必触发 |
+
+### Queue Pause/Resume
+
+```bash
+# 暂停队列（暂停期间任务不派发给 Worker）
+curl -X POST http://localhost:8080/api/queues/default/pause
+
+# 恢复队列
+curl -X POST http://localhost:8080/api/queues/default/resume
+
+# 查看所有队列状态
+curl http://localhost:8080/api/queues
+```
+
+### Cron 调度器
+
+```bash
+# 创建定时任务（支持 s/m/h/d/w 单位）
+curl -X POST http://localhost:8080/api/crons \
+  -H "Content-Type: application/json" \
+  -d '{"name":"daily-report","every":"1h","queue":"default","job_type":"generate_report","data":{"name":"daily"}}'
+
+# 列出所有 cron
+curl http://localhost:8080/api/crons
+
+# 更新 cron
+curl -X PUT http://localhost:8080/api/crons/1 \
+  -H "Content-Type: application/json" \
+  -d '{"name":"daily-report","every":"2h","queue":"default","job_type":"generate_report","data":{}}'
+
+# 删除 cron
+curl -X DELETE http://localhost:8080/api/crons/1
+```
+
+## 内置 Handler 列表
 
 | job_type | 说明 |
 |---|---|
-| `generate_report` | 模拟生成报告（100–500ms） |
-| `send_email` | 模拟发送邮件（50–200ms） |
-| `resize_image` | 模拟图片处理（200–800ms） |
-| `data_sync` | 模拟数据同步（300–1000ms） |
-| `fail_test` | 总是失败，用于测试重试机制 |
-
-## 注册自定义 Handler
-
-```go
-func init() {
-    RegisterHandler("my_job", func(ctx context.Context, jobID int64, data json.RawMessage) (string, error) {
-        var d struct {
-            Name string `json:"name"`
-        }
-        json.Unmarshal(data, &d)
-
-        // 实际处理逻辑（ctx 已设置超时）
-        select {
-        case <-ctx.Done():
-            return "", fmt.Errorf("cancelled: %v", ctx.Err())
-        default:
-        }
-
-        return fmt.Sprintf("processed: %s", d.Name), nil
-    })
-}
-```
-
-## 心跳机制
-
-Worker 内置双层心跳，防止连接被中间代理超时断开：
-
-- **WebSocket 协议级**：每 20 秒发送一次 `PingMessage`（RFC 6455 opcode=9）
-- **JSON 应用级**：服务端 read goroutine 处理 `{"type":"ping"}` 并回复 `{"type":"pong"}`
-
-## 投递任务示例
-
-```bash
-curl -X POST http://localhost:8080/api/jobs \
-  -H "Content-Type: application/json" \
-  -d '{"queue":"default","job_type":"send_email","data":{"to":"user@example.com","subject":"Hello"}}'
-```
-
-详细文档请参阅 [../../doc/README.md](../../doc/README.md)。
+| `send_email` | 发送邮件示例 |
+| `generate_report` | 生成报告示例 |
+| `resize_image` | 图片缩放示例 |
+| `data_sync` | 数据同步示例 |
+| `tag_task` | 按 tags 路由处理示例（v4） |
+| `batch_callback` / `on_success` / `on_failure` / `on_finally` | Batch 回调示例（v4） |
