@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GoQueue Worker Panel
 // @namespace    https://github.com/deepseekretro/go-queue-sqlite
-// @version      4.1.0
+// @version      4.2.0
 // @description  在页面右上角显示 GoQueue Worker 控制面板，实时展示连接状态与任务日志，支持直接投递任务（v4: tags/batch/cron/queue pause/enqueue）
 // @author       GoQueue
 // @match        *://*/*
@@ -243,6 +243,26 @@
       letter-spacing: .04em; text-transform: uppercase;
       margin-bottom: 2px; display: block;
     }
+    #gq-enqueue-modal select {
+      width: 100%;
+      padding: 6px 9px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 12px;
+      outline: none;
+      box-sizing: border-box;
+      cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2364748b'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 9px center;
+      padding-right: 26px;
+    }
+    #gq-enqueue-modal select:focus { border-color: #3b82f6; }
+    #gq-enqueue-modal select option { background: #1e293b; color: #e2e8f0; }
     #gq-enqueue-modal input,
     #gq-enqueue-modal textarea {
       width: 100%;
@@ -329,7 +349,16 @@
       <div id="gq-enqueue-modal">
         <div>
           <label>Job Type <span style="color:#f87171">*</span></label>
-          <input id="enq-job-type" type="text" placeholder="send_email">
+          <select id="enq-job-type">
+            <option value="">— 选择任务类型 —</option>
+            <option value="send_mail">send_mail（发送邮件）</option>
+            <option value="send_email">send_email（发送邮件，别名）</option>
+            <option value="fetch_url">fetch_url（抓取网页）</option>
+            <option value="delay">delay（延迟执行）</option>
+            <option value="local_storage_set">local_storage_set（写 localStorage）</option>
+            <option value="click_element">click_element（点击元素）</option>
+            <option value="tag_task">tag_task（按 tags 路由）</option>
+          </select>
         </div>
         <div>
           <label>队列名</label>
@@ -436,12 +465,59 @@
   });
 
   // ─── 投递任务弹层 ─────────────────────────────────────────────────────────
+
+  // 各 job_type 的默认 payload 和 timeout（秒）
+  const ENQ_TEMPLATES = {
+    send_mail: {
+      payload: { to: 'user@example.com', subject: 'Hello', body: 'Hi there!' },
+      timeout: 30,
+    },
+    send_email: {
+      payload: { to: 'user@example.com', subject: 'Hello', body: 'Hi there!' },
+      timeout: 30,
+    },
+    fetch_url: {
+      payload: { url: 'https://example.com' },
+      timeout: 60,
+    },
+    delay: {
+      payload: { ms: 1000, message: 'hello' },
+      timeout: 10,
+    },
+    local_storage_set: {
+      payload: { key: 'myKey', value: 'myValue' },
+      timeout: 5,
+    },
+    click_element: {
+      payload: { selector: '#submit-btn' },
+      timeout: 5,
+    },
+    tag_task: {
+      payload: { message: 'hello' },
+      timeout: 10,
+    },
+  };
+
+  function fillEnqTemplate() {
+    const jt = $enqJobType.value;
+    const tpl = ENQ_TEMPLATES[jt];
+    if (!tpl) return;
+    // 只在用户未手动修改时才覆盖（payload 为空或仍是上次模板值时覆盖）
+    $enqPayload.value = JSON.stringify(tpl.payload, null, 2);
+    $enqTimeout.value = tpl.timeout;
+  }
+
   $btnEnqueue.addEventListener('click', () => {
     const cfg = getCfg();
     if (!$enqQueue.value) $enqQueue.value = cfg.queue || DEFAULT_QUEUE;
+    // 如果已有选中的 job_type，自动填充模板
+    if ($enqJobType.value) fillEnqTemplate();
     $enqModal.classList.add('open');
     $enqJobType.focus();
   });
+
+  // job_type 切换时自动填充 payload + timeout
+  $enqJobType.addEventListener('change', fillEnqTemplate);
 
   panel.querySelector('#enq-cancel').addEventListener('click', () => {
     $enqModal.classList.remove('open');
@@ -457,7 +533,7 @@
   });
 
   function enqueueJob() {
-    const jobType    = $enqJobType.value.trim();
+    const jobType    = ($enqJobType.value || '').trim();
     const queue      = $enqQueue.value.trim() || DEFAULT_QUEUE;
     const payloadRaw = $enqPayload.value.trim() || '{}';
     const tagsRaw    = $enqTags.value.trim();
@@ -468,7 +544,7 @@
     if (!jobType) {
       $enqJobType.style.borderColor = '#ef4444';
       $enqJobType.focus();
-      addLog('Job Type 不能为空', 'error');
+      addLog('请选择 Job Type', 'error');
       return;
     }
     $enqJobType.style.borderColor = '';
@@ -659,6 +735,33 @@
     on_finally: async (data, tags) => {
       addLog(`[on_finally] batch_id=${data.batch_id}`, 'info');
       return `batch ${data.batch_id} finished`;
+    },
+
+    /**
+     * 发送邮件（模拟）
+     * 投递：{"queue":"default","job_type":"send_mail","data":{"to":"user@example.com","subject":"Hello","body":"Hi there"}}
+     */
+    send_mail: async (data) => {
+      const to      = data.to      || 'unknown@example.com';
+      const subject = data.subject || '(no subject)';
+      const body    = data.body    || '';
+      // 模拟发送延迟
+      await sleep(300);
+      addLog(`📧 send_mail → to=${to} subject="${subject}"`, 'success');
+      return `Mail sent to ${to}: ${subject}`;
+    },
+
+    /**
+     * 发送邮件（别名，兼容 send_email）
+     * 投递：{"queue":"default","job_type":"send_email","data":{"to":"user@example.com","subject":"Hello","body":"Hi"}}
+     */
+    send_email: async (data) => {
+      const to      = data.to      || 'unknown@example.com';
+      const subject = data.subject || '(no subject)';
+      const body    = data.body    || '';
+      await sleep(300);
+      addLog(`📧 send_email → to=${to} subject="${subject}"`, 'success');
+      return `Email sent to ${to}: ${subject}`;
     },
   };
 
