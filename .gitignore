@@ -1,0 +1,11 @@
+# 编译产物
+goapp
+*.db
+*.db-wal
+*.db-shm
+
+# Go 缓存
+/vendor/
+
+# 系统文件
+.DS_Store
