@@ -1,4 +1,4 @@
-# GoQueue 使用文档
+# go-queue-sqlite 使用文档
 
 
 ## 示例仓库
