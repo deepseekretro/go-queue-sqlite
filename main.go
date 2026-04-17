@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -128,8 +129,10 @@ type Job struct {
 }
 
 type Payload struct {
-	JobType string          `json:"job_type"`
-	Data    json.RawMessage `json:"data"`
+	JobType     string          `json:"job_type"`
+	Data        json.RawMessage `json:"data"`
+	TimeoutSec  int             `json:"timeout_sec"`  // 0 = 使用全局默认（60s）
+	MaxAttempts int             `json:"max_attempts"` // 0 = 使用全局默认（MaxAttempts）
 }
 
 func (j *Job) JobType() string {
@@ -144,10 +147,8 @@ type DispatchOptions struct {
 	DedupKey string // 去重 key，相同 key 的任务只保留一个（pending 状态）
 }
 
-func dispatchJob(queue string, jobType string, data interface{}, delaySeconds int64, opts ...DispatchOptions) (int64, error) {
-	dataBytes, _ := json.Marshal(data)
-	p := Payload{JobType: jobType, Data: dataBytes}
-	payloadBytes, _ := json.Marshal(p)
+// dispatchJobRaw 直接用已序列化的 payload 字符串投递任务（handleDispatch 使用）
+func dispatchJobRaw(queue string, rawPayload string, delaySeconds int64, opts ...DispatchOptions) (int64, error) {
 	now := time.Now().Unix()
 	prio := 5
 	var dedupKey *string
@@ -162,7 +163,7 @@ func dispatchJob(queue string, jobType string, data interface{}, delaySeconds in
 	res, err := db.Exec(
 		`INSERT OR IGNORE INTO jobs (queue, payload, status, priority, dedup_key, available_at, created_at, updated_at)
 		 VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`,
-		queue, string(payloadBytes), prio, dedupKey, now+delaySeconds, now, now,
+		queue, rawPayload, prio, dedupKey, now+delaySeconds, now, now,
 	)
 	if err != nil {
 		return 0, err
@@ -170,10 +171,20 @@ func dispatchJob(queue string, jobType string, data interface{}, delaySeconds in
 	id, _ := res.LastInsertId()
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		// 被去重忽略，返回 0 表示未插入
 		return 0, nil
 	}
 	return id, nil
+}
+
+// dispatchJob 构造 payload 并投递任务（内部 Go 代码使用，支持 timeout_sec / max_attempts）
+func dispatchJob(queue string, jobType string, data interface{}, delaySeconds int64, opts ...DispatchOptions) (int64, error) {
+	dataBytes, _ := json.Marshal(data)
+	type fullPayload struct {
+		JobType string          `json:"job_type"`
+		Data    json.RawMessage `json:"data"`
+	}
+	payloadBytes, _ := json.Marshal(fullPayload{JobType: jobType, Data: dataBytes})
+	return dispatchJobRaw(queue, string(payloadBytes), delaySeconds, opts...)
 }
 
 func reserve(queue string) (*Job, error) {
@@ -213,10 +224,14 @@ func reserve(queue string) (*Job, error) {
 }
 
 const (
-	MaxAttempts      = 3              // 最多尝试次数，超过后进死信队列
-	StaleJobTimeout  = 5 * 60        // 任务卡在 running 超过 5 分钟视为 stale
-	RetryBaseDelaySec = 10           // 指数退避基础延迟（秒）
+	MaxAttempts         = 3    // 最多尝试次数，超过后进死信队列
+	StaleJobTimeout     = 5 * 60 // 任务卡在 running 超过 5 分钟视为 stale
+	RetryBaseDelaySec   = 10  // 指数退避基础延迟（秒）
+	DefaultJobTimeoutSec = 60 // 单个任务默认执行超时（秒）
 )
+
+// workerWg 追踪所有正在执行的 GoWorker goroutine，优雅关闭时等待它们完成
+var workerWg sync.WaitGroup
 
 func markDone(id int64) {
 	now := time.Now().Unix()
@@ -229,14 +244,22 @@ func markDone(id int64) {
 //   - attempts >= MaxAttempts → 进死信队列（failed_jobs）
 func handleJobFailure(j *Job, reason string) {
 	now := time.Now().Unix()
-	if j.Attempts < MaxAttempts {
+
+	// per-job MaxAttempts：从 payload 读取，0 则使用全局默认
+	maxAttempts := MaxAttempts
+	var pf Payload
+	if err := json.Unmarshal([]byte(j.Payload), &pf); err == nil && pf.MaxAttempts > 0 {
+		maxAttempts = pf.MaxAttempts
+	}
+
+	if j.Attempts < maxAttempts {
 		// 指数退避：第 N 次重试延迟 2^(N-1) * RetryBaseDelaySec 秒
 		delaySec := int64(1<<uint(j.Attempts-1)) * RetryBaseDelaySec
 		availAt := now + delaySec
 		db.Exec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE id=?`,
 			availAt, now, j.ID)
 		log.Printf("[Queue] Job #%d will retry (attempt %d/%d) in %ds — reason: %s",
-			j.ID, j.Attempts, MaxAttempts, delaySec, reason)
+			j.ID, j.Attempts, maxAttempts, delaySec, reason)
 	} else {
 		// 超过最大重试次数，进死信队列
 		jobType := j.JobType()
@@ -245,6 +268,7 @@ func handleJobFailure(j *Job, reason string) {
 			j.Queue, jobType, j.Payload, j.Attempts, reason, now)
 		log.Printf("[Queue] Job #%d → DLQ after %d attempts — reason: %s", j.ID, j.Attempts, reason)
 	}
+	broadcastStats()
 }
 
 // markFailed 保留作为直接进 DLQ 的快捷方式（payload 解析失败等不可重试的错误）
@@ -542,13 +566,41 @@ func startStaleJobReaper() {
 // Fallback Go Worker
 // ─────────────────────────────────────────────
 
+// processJobInternal 执行任务，支持 per-job 超时（context.WithTimeout）
+// timeout 优先级：payload.TimeoutSec > DefaultJobTimeoutSec
 func processJobInternal(j *Job) error {
 	var p Payload
 	if err := json.Unmarshal([]byte(j.Payload), &p); err != nil {
 		return fmt.Errorf("invalid payload: %w", err)
 	}
-	log.Printf("[GoWorker] Processing job #%d type=%s queue=%s attempt=%d",
-		j.ID, p.JobType, j.Queue, j.Attempts)
+
+	// 确定超时时长
+	timeoutSec := p.TimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = DefaultJobTimeoutSec
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	log.Printf("[GoWorker] Processing job #%d type=%s queue=%s attempt=%d timeout=%ds",
+		j.ID, p.JobType, j.Queue, j.Attempts, timeoutSec)
+
+	// 用 channel 包装实际执行，以便 context 超时可以中断
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runJob(ctx, &p)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return fmt.Errorf("job timed out after %ds", timeoutSec)
+	}
+}
+
+// runJob 执行具体的任务逻辑，接受 context 以支持取消
+func runJob(ctx context.Context, p *Payload) error {
 	switch p.JobType {
 	case "send_email":
 		var d struct {
@@ -556,17 +608,29 @@ func processJobInternal(j *Job) error {
 			Subject string `json:"subject"`
 		}
 		json.Unmarshal(p.Data, &d)
-		time.Sleep(1 * time.Second)
+		select {
+		case <-time.After(1 * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		log.Printf("[GoWorker] ✉  Email sent to %s: %s", d.To, d.Subject)
 	case "generate_report":
 		var d struct{ Name string `json:"name"` }
 		json.Unmarshal(p.Data, &d)
-		time.Sleep(2 * time.Second)
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		log.Printf("[GoWorker] 📊 Report generated: %s", d.Name)
 	case "resize_image":
 		var d struct{ URL string `json:"url"` }
 		json.Unmarshal(p.Data, &d)
-		time.Sleep(1500 * time.Millisecond)
+		select {
+		case <-time.After(1500 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		log.Printf("[GoWorker] 🖼  Image resized: %s", d.URL)
 	case "fail_job":
 		return fmt.Errorf("intentional failure for testing")
@@ -576,10 +640,19 @@ func processJobInternal(j *Job) error {
 	return nil
 }
 
+// stopGoWorker 用于通知 GoWorker 停止接受新任务
+var stopGoWorker = make(chan struct{})
+
 func startGoWorker(queue string, concurrency int) {
 	sem := make(chan struct{}, concurrency)
 	go func() {
 		for {
+			select {
+			case <-stopGoWorker:
+				log.Printf("[GoWorker] queue=%s stopping, waiting for running jobs...", queue)
+				return
+			default:
+			}
 			sem <- struct{}{}
 			go func() {
 				defer func() { <-sem }()
@@ -593,6 +666,9 @@ func startGoWorker(queue string, concurrency int) {
 					time.Sleep(500 * time.Millisecond)
 					return
 				}
+				// 追踪 running job，优雅关闭时等待
+				workerWg.Add(1)
+				defer workerWg.Done()
 				if err := processJobInternal(j); err != nil {
 					markFailed(j, err.Error())
 					log.Printf("[GoWorker] job #%d failed: %v", j.ID, err)
@@ -664,12 +740,14 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 	// 限制请求体最大 1MB，防止恶意大 payload 撑爆内存
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
-		Queue    string          `json:"queue"`
-		JobType  string          `json:"job_type"`
-		Data     json.RawMessage `json:"data"`
-		Delay    int64           `json:"delay"`
-		Priority int             `json:"priority"`
-		DedupKey string          `json:"dedup_key"`
+		Queue       string          `json:"queue"`
+		JobType     string          `json:"job_type"`
+		Data        json.RawMessage `json:"data"`
+		Delay       int64           `json:"delay"`
+		Priority    int             `json:"priority"`
+		DedupKey    string          `json:"dedup_key"`
+		TimeoutSec  int             `json:"timeout_sec"`
+		MaxAttempts int             `json:"max_attempts"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		if strings.Contains(err.Error(), "http: request body too large") {
@@ -682,7 +760,26 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if req.Queue == "" {
 		req.Queue = "default"
 	}
-	id, err := dispatchJob(req.Queue, req.JobType, req.Data, req.Delay, DispatchOptions{
+	// 把 per-job 控制字段合并进 payload data，以便 worker 读取
+	type enrichedData struct {
+		*json.RawMessage
+		TimeoutSec  int `json:"timeout_sec,omitempty"`
+		MaxAttempts int `json:"max_attempts,omitempty"`
+	}
+	// 直接把 timeout_sec / max_attempts 写入顶层 payload（Payload struct 字段）
+	type fullPayload struct {
+		JobType     string          `json:"job_type"`
+		Data        json.RawMessage `json:"data"`
+		TimeoutSec  int             `json:"timeout_sec,omitempty"`
+		MaxAttempts int             `json:"max_attempts,omitempty"`
+	}
+	payloadBytes, _ := json.Marshal(fullPayload{
+		JobType:     req.JobType,
+		Data:        req.Data,
+		TimeoutSec:  req.TimeoutSec,
+		MaxAttempts: req.MaxAttempts,
+	})
+	id, err := dispatchJobRaw(req.Queue, string(payloadBytes), req.Delay, DispatchOptions{
 		Priority: req.Priority,
 		DedupKey: req.DedupKey,
 	})
@@ -1042,5 +1139,30 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	log.Println("[HTTP] Shutting down...")
+	log.Println("[HTTP] Shutting down gracefully...")
+
+	// 1. 停止 GoWorker 接受新任务
+	close(stopGoWorker)
+
+	// 2. 等待所有 running job 完成（最多 DefaultJobTimeoutSec + 5s）
+	waitDone := make(chan struct{})
+	go func() {
+		workerWg.Wait()
+		close(waitDone)
+	}()
+	shutdownTimeout := time.Duration(DefaultJobTimeoutSec+5) * time.Second
+	select {
+	case <-waitDone:
+		log.Println("[HTTP] All running jobs finished ✓")
+	case <-time.After(shutdownTimeout):
+		log.Printf("[HTTP] Shutdown timeout (%s), forcing exit", shutdownTimeout)
+	}
+
+	// 3. 优雅关闭 HTTP server（5s 超时）
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("[HTTP] Server forced to shutdown: %v", err)
+	}
+	log.Println("[HTTP] Server stopped ✓")
 }
