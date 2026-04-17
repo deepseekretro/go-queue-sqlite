@@ -104,10 +104,14 @@ const indexHTML = `<!DOCTYPE html>
     <h1>⚡ Go Queue Dashboard</h1>
     <span>Laravel-style Database Queue · SQLite · WebSocket Workers</span>
   </div>
-  <div style="margin-left:auto;display:flex;align-items:center;gap:8px;">
+  <div style="margin-left:auto;display:flex;align-items:center;gap:12px;">
     <span class="dot dot-running"></span>
     <span style="font-size:.8rem;color:#34d399">Server Active</span>
-    <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;margin-left:12px" onclick="loadAll()">↻ Refresh</button>
+    <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;" onclick="loadAll()">↻ Refresh</button>
+    <div style="display:flex;align-items:center;gap:8px;margin-left:8px;padding-left:12px;border-left:1px solid #334155;">
+      <span style="font-size:.8rem;color:#94a3b8;">👤 <span id="current-user">admin</span></span>
+      <a href="/logout" style="font-size:.8rem;padding:5px 12px;background:#7f1d1d;border:1px solid #991b1b;color:#fca5a5;border-radius:6px;text-decoration:none;transition:opacity .2s;" onmouseover="this.style.opacity='.8'" onmouseout="this.style.opacity='1'">登出</a>
+    </div>
   </div>
 </header>
 
@@ -742,6 +746,28 @@ function loadAll() { loadStats(); loadJobs(); }
 })();
 
 loadAll();
+
+// ─── 获取当前登录用户名 ─────────────────────────────────────────────────────
+fetch('/api/me', {credentials: 'same-origin'})
+  .then(r => r.json())
+  .then(d => {
+    const el = document.getElementById('current-user');
+    if (el && d.username) el.textContent = d.username;
+  })
+  .catch(() => {});
+
+// ─── 全局 fetch 拦截：API 返回 401 时自动跳转登录页 ─────────────────────────
+(function patchFetch() {
+  const _fetch = window.fetch;
+  window.fetch = function(...args) {
+    return _fetch.apply(this, args).then(resp => {
+      if (resp.status === 401 && !resp.url.includes('/login')) {
+        window.location.href = '/login?next=' + encodeURIComponent(window.location.pathname);
+      }
+      return resp;
+    });
+  };
+})();
 </script>
 </body>
 </html>

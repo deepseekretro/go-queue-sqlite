@@ -133,6 +133,7 @@ type Payload struct {
 	Data        json.RawMessage `json:"data"`
 	TimeoutSec  int             `json:"timeout_sec"`  // 0 = 使用全局默认（60s）
 	MaxAttempts int             `json:"max_attempts"` // 0 = 使用全局默认（MaxAttempts）
+	Backoff     []int           `json:"backoff"`      // P3-1: 自定义重试延迟数组（秒），第 N 次重试用第 N 个值
 }
 
 func (j *Job) JobType() string {
@@ -253,8 +254,18 @@ func handleJobFailure(j *Job, reason string) {
 	}
 
 	if j.Attempts < maxAttempts {
-		// 指数退避：第 N 次重试延迟 2^(N-1) * RetryBaseDelaySec 秒
-		delaySec := int64(1<<uint(j.Attempts-1)) * RetryBaseDelaySec
+		// P3-1: 优先使用 per-job Backoff 数组，否则指数退避
+		var delaySec int64
+		if len(pf.Backoff) > 0 {
+			idx := j.Attempts - 1
+			if idx >= len(pf.Backoff) {
+				idx = len(pf.Backoff) - 1
+			}
+			delaySec = int64(pf.Backoff[idx])
+		} else {
+			// 指数退避：第 N 次重试延迟 2^(N-1) * RetryBaseDelaySec 秒
+			delaySec = int64(1<<uint(j.Attempts-1)) * RetryBaseDelaySec
+		}
 		availAt := now + delaySec
 		db.Exec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE id=?`,
 			availAt, now, j.ID)
@@ -352,6 +363,34 @@ func (h *WorkerHub) count() int {
 	return len(h.workers)
 }
 
+// countForQueue 返回指定队列的在线 worker 数量
+func (h *WorkerHub) countForQueue(queue string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	count := 0
+	for _, w := range h.workers {
+		if w.queue == queue {
+			count++
+		}
+	}
+	return count
+}
+
+// activeQueues 返回当前所有有 WS Worker 连接的队列列表（去重）
+func (h *WorkerHub) activeQueues() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	seen := map[string]bool{}
+	var queues []string
+	for _, w := range h.workers {
+		if w.queue != "" && !seen[w.queue] {
+			seen[w.queue] = true
+			queues = append(queues, w.queue)
+		}
+	}
+	return queues
+}
+
 func (h *WorkerHub) dispatchToWs(j *Job) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -393,10 +432,16 @@ func (h *WorkerHub) dispatchToWs(j *Job) bool {
 }
 
 // WS dispatcher: polls DB and sends to connected WS workers
+// startWsDispatcher 为指定队列启动一个 WS 派发 goroutine
 func startWsDispatcher(queue string) {
 	go func() {
 		for {
-			if hub.count() == 0 {
+			select {
+			case <-stopGoWorker:
+				return
+			default:
+			}
+			if hub.countForQueue(queue) == 0 {
 				time.Sleep(500 * time.Millisecond)
 				continue
 			}
@@ -418,6 +463,31 @@ func startWsDispatcher(queue string) {
 		}
 	}()
 	log.Printf("[WsDispatcher] Started for queue=%s", queue)
+}
+
+// startDynamicWsDispatcher 监控 hub，当有新队列的 WS Worker 连接时自动启动 dispatcher
+func startDynamicWsDispatcher() {
+	go func() {
+		started := map[string]bool{}
+		for {
+			select {
+			case <-stopGoWorker:
+				return
+			default:
+			}
+			// 获取当前所有已连接 worker 的队列列表
+			queues := hub.activeQueues()
+			for _, q := range queues {
+				if !started[q] {
+					startWsDispatcher(q)
+					started[q] = true
+					log.Printf("[DynamicDispatcher] Auto-started dispatcher for queue=%s", q)
+				}
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}()
+	log.Printf("[DynamicDispatcher] Started — watching for new queues")
 }
 
 // ─────────────────────────────────────────────
@@ -669,11 +739,18 @@ func startGoWorker(queue string, concurrency int) {
 				// 追踪 running job，优雅关闭时等待
 				workerWg.Add(1)
 				defer workerWg.Done()
+				// P2-1: 限流检查，超限则放回 pending
+				if checkRateLimit(j) {
+					return
+				}
 				if err := processJobInternal(j); err != nil {
 					markFailed(j, err.Error())
 					log.Printf("[GoWorker] job #%d failed: %v", j.ID, err)
 				} else {
-					markDone(j.ID)
+					// P2-3: 任务链支持，读取 next_job 字段
+					var nextJob string
+					db.QueryRow(`SELECT next_job FROM jobs WHERE id=?`, j.ID).Scan(&nextJob)
+					markDoneWithChain(j.ID, nextJob)
 					log.Printf("[GoWorker] job #%d done ✓", j.ID)
 				}
 			}()
@@ -748,6 +825,8 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 		DedupKey    string          `json:"dedup_key"`
 		TimeoutSec  int             `json:"timeout_sec"`
 		MaxAttempts int             `json:"max_attempts"`
+		NextJob      *ChainedJob     `json:"next_job,omitempty"` // P2-3: 任务链
+		Backoff      []int           `json:"backoff,omitempty"`  // P3-1: 自定义重试延迟
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		if strings.Contains(err.Error(), "http: request body too large") {
@@ -772,12 +851,14 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 		Data        json.RawMessage `json:"data"`
 		TimeoutSec  int             `json:"timeout_sec,omitempty"`
 		MaxAttempts int             `json:"max_attempts,omitempty"`
+		Backoff     []int           `json:"backoff,omitempty"` // P3-1
 	}
 	payloadBytes, _ := json.Marshal(fullPayload{
 		JobType:     req.JobType,
 		Data:        req.Data,
 		TimeoutSec:  req.TimeoutSec,
 		MaxAttempts: req.MaxAttempts,
+		Backoff:     req.Backoff,
 	})
 	id, err := dispatchJobRaw(req.Queue, string(payloadBytes), req.Delay, DispatchOptions{
 		Priority: req.Priority,
@@ -791,6 +872,11 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 		// 被去重忽略
 		jsonResp(w, 200, map[string]interface{}{"job_id": 0, "queue": req.Queue, "status": "deduplicated", "message": "job skipped: duplicate dedup_key"})
 		return
+	}
+	// P2-3: 写入 next_job 到 jobs 表
+	if req.NextJob != nil {
+		nextJobBytes, _ := json.Marshal(req.NextJob)
+		db.Exec(`UPDATE jobs SET next_job=? WHERE id=?`, string(nextJobBytes), id)
 	}
 	jsonResp(w, 201, map[string]interface{}{"job_id": id, "queue": req.Queue, "status": "pending"})
 }
@@ -1057,6 +1143,18 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleMe GET /api/me — 返回当前登录用户信息
+func handleMe(w http.ResponseWriter, r *http.Request) {
+	username := ""
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		if s := getSession(cookie.Value); s != nil {
+			username = s.username
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"username":%q}`, username)
+}
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, indexHTML)
@@ -1069,12 +1167,14 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func main() {
 	initLogger()
 	initDB()
+	initBatchDB()
 
 	startStaleJobReaper()
-	startGoWorker("default", 2)
-	startGoWorker("emails", 1)
-	startWsDispatcher("default")
-	startWsDispatcher("emails")
+	startHeartbeatReaper()
+	startSessionReaper()
+	// 内置 GoWorker 已移除 — 任务由外部 WS Worker 处理
+	// 启动动态 WsDispatcher（自动感知所有有 WS Worker 连接的队列）
+	startDynamicWsDispatcher()
 
 	mux := http.NewServeMux()
 	// API 鉴权中间件：读取环境变量 API_KEY，若设置则要求请求携带 X-API-Key header
@@ -1104,7 +1204,15 @@ func main() {
 		}
 	}
 
-	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/", requireLogin(handleIndex))
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			handleLoginSubmit(w, r)
+		} else {
+			handleLoginPage(w, r)
+		}
+	})
+	mux.HandleFunc("/logout", handleLogout)
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/metrics", handleMetrics)
 	mux.HandleFunc("/ws/worker", handleWorkerWS)
@@ -1123,8 +1231,24 @@ func main() {
 			http.NotFound(w, r)
 		}
 	})))
+	mux.HandleFunc("/api/rate-limits", cors(auth(handleRateLimits)))
+	mux.HandleFunc("/api/workers", cors(auth(handleWorkersList)))
+	mux.HandleFunc("/api/workers/", cors(auth(handleWorkerHeartbeat)))
+	mux.HandleFunc("/api/batches", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			handleBatches(w, r)
+		} else if r.Method == http.MethodGet {
+			handleBatchList(w, r)
+		} else {
+			http.Error(w, "method not allowed", 405)
+		}
+	})))
+	mux.HandleFunc("/api/batches/", cors(auth(handleBatchStatus)))
+	mux.HandleFunc("/api/backend", cors(auth(handleBackendInfo)))    // P3-2: 后端信息
+	mux.HandleFunc("/api/autoscale", cors(auth(handleAutoScale)))    // P3-3: 动态扩缩容
 	mux.HandleFunc("/api/stats", cors(auth(handleStats)))
-	mux.HandleFunc("/api/events", handleSSE)
+	mux.HandleFunc("/api/me", requireLogin(handleMe))
+	mux.HandleFunc("/api/events", requireLogin(handleSSE))
 	mux.HandleFunc("/api/jobs/failed", cors(auth(handleClearFailed)))
 	mux.HandleFunc("/api/jobs/retry-failed", cors(auth(handleRetryFailed)))
 
