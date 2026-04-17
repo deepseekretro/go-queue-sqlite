@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -28,6 +29,8 @@ func initDB() {
 		log.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
+
+	// 建表（首次运行）
 	schema := `
 	CREATE TABLE IF NOT EXISTS jobs (
 		id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,15 +44,32 @@ func initDB() {
 	);
 	CREATE TABLE IF NOT EXISTS failed_jobs (
 		id        INTEGER PRIMARY KEY AUTOINCREMENT,
-		queue     TEXT NOT NULL,
-		payload   TEXT NOT NULL,
-		exception TEXT NOT NULL,
+		queue     TEXT    NOT NULL,
+		job_type  TEXT    NOT NULL DEFAULT '',
+		payload   TEXT    NOT NULL,
+		attempts  INTEGER NOT NULL DEFAULT 0,
+		exception TEXT    NOT NULL,
 		failed_at INTEGER NOT NULL
 	);`
 	if _, err = db.Exec(schema); err != nil {
 		log.Fatal(err)
 	}
-	log.Println("[DB] SQLite (pure Go / modernc.org/sqlite) initialized ✓")
+
+	// 迁移：为旧库的 failed_jobs 表补充新字段（ALTER TABLE IF NOT EXISTS 列不存在才加）
+	migrations := []string{
+		`ALTER TABLE failed_jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE failed_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+	}
+	for _, m := range migrations {
+		if _, err := db.Exec(m); err != nil {
+			// SQLite 不支持 IF NOT EXISTS on ALTER，重复执行会报 "duplicate column"，忽略即可
+			if !strings.Contains(err.Error(), "duplicate column") {
+				log.Printf("[DB] migration warning: %v", err)
+			}
+		}
+	}
+
+	log.Println("[DB] SQLite initialized ✓ (migrations applied)")
 }
 
 // ─────────────────────────────────────────────
@@ -531,11 +551,53 @@ func jsonResp(w http.ResponseWriter, code int, v interface{}) {
 	json.NewEncoder(w).Encode(v)
 }
 
+func handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	// 从 URL 路径中提取 job id：/api/jobs/123
+	path := r.URL.Path // e.g. "/api/jobs/123"
+	parts := strings.Split(strings.TrimPrefix(path, "/api/jobs/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		jsonResp(w, 400, map[string]string{"error": "missing job id"})
+		return
+	}
+	var id int64
+	if _, err := fmt.Sscanf(parts[0], "%d", &id); err != nil || id <= 0 {
+		jsonResp(w, 400, map[string]string{"error": "invalid job id"})
+		return
+	}
+	// 只允许取消 pending 状态的任务
+	res, err := db.Exec(`UPDATE jobs SET status='cancelled', updated_at=? WHERE id=? AND status='pending'`,
+		time.Now().Unix(), id)
+	if err != nil {
+		jsonResp(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		// 检查任务是否存在
+		var status string
+		err := db.QueryRow(`SELECT status FROM jobs WHERE id=?`, id).Scan(&status)
+		if err == sql.ErrNoRows {
+			jsonResp(w, 404, map[string]string{"error": "job not found"})
+		} else {
+			jsonResp(w, 409, map[string]string{"error": fmt.Sprintf("cannot cancel job in status '%s'", status)})
+		}
+		return
+	}
+	log.Printf("[API] Job #%d cancelled", id)
+	jsonResp(w, 200, map[string]interface{}{"job_id": id, "status": "cancelled"})
+}
+
 func handleDispatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	// 限制请求体最大 1MB，防止恶意大 payload 撑爆内存
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	var req struct {
 		Queue   string          `json:"queue"`
 		JobType string          `json:"job_type"`
@@ -543,6 +605,10 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 		Delay   int64           `json:"delay"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if strings.Contains(err.Error(), "http: request body too large") {
+			jsonResp(w, 413, map[string]string{"error": "payload too large (max 1MB)"})
+			return
+		}
 		jsonResp(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
@@ -632,6 +698,32 @@ func handleRetryFailed(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, map[string]string{"message": "failed jobs re-queued"})
 }
 
+var startTime = time.Now()
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	// 检查 DB 连通性
+	dbStatus := "ok"
+	if err := db.Ping(); err != nil {
+		dbStatus = "error: " + err.Error()
+	}
+	uptime := int64(time.Since(startTime).Seconds())
+	status := "ok"
+	if dbStatus != "ok" {
+		status = "degraded"
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if status != "ok" {
+		w.WriteHeader(503)
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     status,
+		"db":         dbStatus,
+		"uptime_sec": uptime,
+		"ws_workers": hub.count(),
+		"version":    "1.0.0",
+	})
+}
+
 func handleIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, indexHTML)
@@ -665,12 +757,21 @@ func main() {
 	}
 
 	mux.HandleFunc("/", handleIndex)
+	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/ws/worker", handleWorkerWS)
 	mux.HandleFunc("/api/jobs", cors(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleDispatch(w, r)
 		} else {
 			handleListJobs(w, r)
+		}
+	}))
+	// /api/jobs/:id — DELETE to cancel a pending job
+	mux.HandleFunc("/api/jobs/", cors(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			handleCancelJob(w, r)
+		} else {
+			http.NotFound(w, r)
 		}
 	}))
 	mux.HandleFunc("/api/stats", cors(handleStats))
