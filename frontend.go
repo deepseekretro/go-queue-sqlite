@@ -71,6 +71,7 @@ const indexHTML = `<!DOCTYPE html>
   .ws-label.error { color: #f87171; }
 
   .log-box { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.78rem; line-height: 1.6; }
+  .log-box div { padding: 1px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
   .log-box .log-info  { color: #60a5fa; }
   .log-box .log-ok    { color: #86efac; }
   .log-box .log-warn  { color: #fbbf24; }
@@ -156,7 +157,7 @@ const indexHTML = `<!DOCTYPE html>
       </div>
 
       <div class="log-box" id="ws-log">
-        <span class="log-info">// WebSocket Worker 日志将在此显示...</span>
+        <div><span class="log-info">// WebSocket Worker 日志将在此显示...</span></div>
       </div>
 
       <div class="actions" style="margin-top:12px;">
@@ -453,7 +454,7 @@ let wsRunning = false;
 function wsLog(msg, cls = 'log-info') {
   const box = document.getElementById('ws-log');
   const ts = new Date().toLocaleTimeString('zh-CN', {hour12: false});
-  box.innerHTML += ` + "`" + `\n<span class="log-ts">${ts}</span><span class="${cls}">${escHtml(msg)}</span>` + "`" + `;
+  box.innerHTML += ` + "`" + `<div><span class="log-ts">${ts}</span><span class="${cls}">${escHtml(msg)}</span></div>` + "`" + `;
   box.scrollTop = box.scrollHeight;
 }
 
@@ -462,7 +463,7 @@ function escHtml(s) {
 }
 
 function clearLog() {
-  document.getElementById('ws-log').innerHTML = '<span class="log-info">// 日志已清空</span>';
+  document.getElementById('ws-log').innerHTML = '<div><span class="log-info">// 日志已清空</span></div>';
 }
 
 function setWsStatus(state, text) {
