@@ -1,5 +1,19 @@
 # GoQueue 使用文档
 
+
+## 示例仓库
+
+本项目在 GitHub 仓库的 `examples/` 目录下提供以下官方示例：
+
+| 示例 | 语言 / 环境 | 链接 |
+|---|---|---|
+| GoWorker | Go | [examples/goworker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/goworker) |
+| JS Worker | Node.js | [examples/js-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/js-worker) |
+| Python Worker | Python | [examples/python-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/python-worker) |
+| Tampermonkey 油猴脚本 | 浏览器 | [examples/tampermonkey](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/tampermonkey) |
+
+---
+
 > 版本 1.0.0 · 基于 WebSocket 的轻量级任务队列系统
 
 ---
