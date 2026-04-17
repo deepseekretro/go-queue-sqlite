@@ -58,6 +58,17 @@ const indexHTML = `<!DOCTYPE html>
   .payload-cell { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-family: monospace; font-size: 0.75rem; }
   .ts { color: #64748b; font-size: 0.75rem; }
 
+  /* Workers Panel */
+  .workers-panel { border-color: #0e7490; }
+  .workers-panel h2 { color: #67e8f9; }
+  .worker-row-idle td { }
+  .worker-row-busy td { background: rgba(52,211,153,0.04); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.72rem; font-weight: 600; }
+  .badge-idle  { background: #1e3a2f; color: #34d399; border: 1px solid #34d399; }
+  .badge-busy  { background: #1a3a1a; color: #86efac; border: 1px solid #22c55e; animation: pulse 1.5s infinite; }
+  .btn-kick { background: #450a0a; border: 1px solid #ef4444; color: #f87171; padding: 3px 10px; border-radius: 6px; font-size: 0.75rem; cursor: pointer; transition: background .2s; }
+  .btn-kick:hover { background: #7f1d1d; }
+
   /* WebSocket Worker Panel */
   .ws-panel { border-color: #4c1d95; }
   .ws-panel h2 { color: #c4b5fd; }
@@ -234,6 +245,27 @@ const indexHTML = `<!DOCTYPE html>
         <button class="batch-btn" onclick="batchDispatch('fail_job',3)">3× fail_job</button>
         <button class="batch-btn" onclick="batchDispatch('send_email',10)">10× send_email (stress)</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Workers Panel -->
+  <div class="panel workers-panel">
+    <h2>🖥 Connected Workers</h2>
+    <div class="table-wrap">
+      <table id="workers-table">
+        <thead>
+          <tr>
+            <th>Worker ID</th>
+            <th>Queue</th>
+            <th>Status</th>
+            <th>Current Job</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="workers-tbody">
+          <tr><td colspan="5" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
@@ -667,6 +699,58 @@ async function loadStats() {
   document.getElementById('s-ws').textContent      = s.ws_workers || 0;
   const total = (s.pending||0)+(s.running||0)+(s.done||0)+(s.failed||0);
   document.getElementById('s-total').textContent = total;
+  loadWorkers();
+}
+
+async function loadWorkers() {
+  const res = await fetch('/api/workers');
+  if (!res.ok) return;
+  const workers = await res.json();
+  const tbody = document.getElementById('workers-tbody');
+  if (!workers || workers.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:24px">No workers connected</td></tr>';
+    return;
+  }
+  tbody.innerHTML = workers.map(function(w) {
+    var isIdle = w.idle;
+    var statusBadge = isIdle
+      ? '<span class="badge badge-idle">&#9679; Idle</span>'
+      : '<span class="badge badge-busy">&#9679; Busy</span>';
+    var currentJob = w.current_job_id
+      ? '<a href="#" onclick="filterByJob(' + w.current_job_id + ');return false;" style="color:#60a5fa">#' + w.current_job_id + '</a>'
+      : '<span style="color:#475569">&mdash;</span>';
+    var shortId = w.id.length > 20 ? '\u2026' + w.id.slice(-16) : w.id;
+    var rowClass = isIdle ? 'worker-row-idle' : 'worker-row-busy';
+    return '<tr class="' + rowClass + '">'
+      + '<td style="font-family:monospace;font-size:0.75rem" title="' + escHtml(w.id) + '">' + escHtml(shortId) + '</td>'
+      + '<td><span style="color:#a78bfa">' + escHtml(w.queue) + '</span></td>'
+      + '<td>' + statusBadge + '</td>'
+      + '<td>' + currentJob + '</td>'
+      + '<td><button class="btn-kick" onclick="kickWorker(\'' + escHtml(w.id) + '\', this)">&#9889; Kick</button></td>'
+      + '</tr>';
+  }).join('');
+}
+
+async function kickWorker(workerId, btn) {
+  if (!confirm('确定要踢掉 Worker ' + workerId + ' 吗？\n当前任务将被放回队列重新处理。')) return;
+  btn.disabled = true;
+  btn.textContent = '...';
+  const res = await fetch('/api/workers/' + encodeURIComponent(workerId), { method: 'DELETE' });
+  const data = await res.json();
+  if (res.ok) {
+    toast('✅ ' + (data.message || 'Worker kicked'));
+    setTimeout(loadWorkers, 1000);
+  } else {
+    toast('❌ ' + (data.error || 'Failed to kick worker'), true);
+    btn.disabled = false;
+    btn.textContent = '⚡ Kick';
+  }
+}
+
+function filterByJob(jobId) {
+  document.getElementById('f-queue').value = '';
+  document.getElementById('f-status').value = '';
+  loadJobs();
 }
 
 function fmtTime(unix) {

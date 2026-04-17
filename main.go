@@ -318,8 +318,9 @@ type WsWorker struct {
 	send         chan []byte
 	result       chan WsResultMessage
 	done         chan struct{}
-	currentJobID int64  // 当前正在处理的任务 ID，断连时用于放回 pending
-	idle         bool   // true = 空闲，可接受新任务
+	kick         chan struct{} // 收到信号后主动断开连接（被踢）
+	currentJobID int64        // 当前正在处理的任务 ID，断连时用于放回 pending
+	idle         bool         // true = 空闲，可接受新任务
 }
 
 type WorkerHub struct {
@@ -335,9 +336,26 @@ func (h *WorkerHub) register(w *WsWorker) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	w.idle = true
+	w.kick = make(chan struct{}, 1) // 初始化 kick channel
 	h.workers[w.id] = w
 	h.rrKeys = append(h.rrKeys, w.id)
 	log.Printf("[Hub] Worker registered: id=%s queue=%s total=%d", w.id, w.queue, len(h.workers))
+}
+
+// kickWorker 向指定 worker 发送 kick 信号，使其主动断开连接
+// 返回 true 表示找到并发送了信号，false 表示 worker 不存在
+func (h *WorkerHub) kickWorker(id string) bool {
+	h.mu.Lock()
+	w, ok := h.workers[id]
+	h.mu.Unlock()
+	if !ok {
+		return false
+	}
+	select {
+	case w.kick <- struct{}{}:
+	default: // 已有 kick 信号在队列中，忽略重复
+	}
+	return true
 }
 
 func (h *WorkerHub) unregister(id string) {
@@ -560,6 +578,15 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		select {
+		case <-worker.kick:
+			// 被 dashboard 踢掉：发送关闭帧（opcode=8, code=1000），然后断开
+			// RFC 6455: close frame payload = 2-byte status code (big-endian) + reason
+			closePayload := []byte{0x03, 0xe8} // 1000 = normal closure
+			closePayload = append(closePayload, []byte("kicked by admin")...)
+			conn.WriteMessage(8, closePayload)
+			rescheduleCurrentJob("kicked by admin")
+			log.Printf("[WS] Worker %s kicked by admin", workerID)
+			return
 		case <-worker.done:
 			rescheduleCurrentJob("disconnected")
 			log.Printf("[WS] Worker %s disconnected", workerID)
@@ -590,6 +617,14 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 					markFailed(&j, result.Error)
 					log.Printf("[WS] Job #%d failed by worker %s: %s", result.JobID, workerID, result.Error)
 				}
+			case <-worker.kick:
+				// 任务处理中被踢：先把任务放回 pending，再关闭连接
+				closePayload := []byte{0x03, 0xe8}
+				closePayload = append(closePayload, []byte("kicked by admin")...)
+				conn.WriteMessage(8, closePayload)
+				rescheduleCurrentJob("kicked by admin while processing")
+				log.Printf("[WS] Worker %s kicked by admin while processing", workerID)
+				return
 			case <-time.After(30 * time.Second):
 				rescheduleCurrentJob("30s timeout")
 				log.Printf("[WS] Worker %s timed out, disconnecting", workerID)
@@ -1233,7 +1268,15 @@ func main() {
 	})))
 	mux.HandleFunc("/api/rate-limits", cors(auth(handleRateLimits)))
 	mux.HandleFunc("/api/workers", cors(auth(handleWorkersList)))
-	mux.HandleFunc("/api/workers/", cors(auth(handleWorkerHeartbeat)))
+	mux.HandleFunc("/api/workers/", cors(auth(func(w http.ResponseWriter, r *http.Request) {
+		// DELETE /api/workers/{id}  → kick worker
+		// POST   /api/workers/{id}/heartbeat → heartbeat
+		if r.Method == http.MethodDelete {
+			handleKickWorker(w, r)
+		} else {
+			handleWorkerHeartbeat(w, r)
+		}
+	})))
 	mux.HandleFunc("/api/batches", cors(auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleBatches(w, r)

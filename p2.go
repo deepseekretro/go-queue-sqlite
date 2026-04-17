@@ -252,6 +252,30 @@ func handleWorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleWorkersList GET /api/workers
+// handleKickWorker DELETE /api/workers/{id} — 踢掉指定 worker
+func handleKickWorker(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	parts := splitPath(r.URL.Path)
+	// parts: ["api", "workers", "{id}"]
+	if len(parts) < 3 {
+		jsonResp(w, 400, map[string]string{"error": "worker id required"})
+		return
+	}
+	workerID := parts[2]
+	if hub.kickWorker(workerID) {
+		log.Printf("[API] Worker %s kicked via dashboard", workerID)
+		jsonResp(w, 200, map[string]interface{}{
+			"worker_id": workerID,
+			"message":   "worker kicked, connection will close shortly",
+		})
+	} else {
+		jsonResp(w, 404, map[string]string{"error": "worker not found: " + workerID})
+	}
+}
+
 func handleWorkersList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", 405)
