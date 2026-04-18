@@ -11,19 +11,21 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /dir — 目录浏览 & 文件下载
+// /dir — 目录浏览、文本预览 & 文件下载
 //
 // URL 设计：
-//   GET /dir              → 显示 goapp 所在目录（默认根）
-//   GET /dir?path=/       → 访问 Linux 根目录
-//   GET /dir?path=/etc    → 访问任意绝对路径
-//   GET /dir?path=..      → 相对于当前目录的上级（会被转为绝对路径）
-//   GET /dir?path=/foo/bar.txt → 下载文件
+//   GET /dir                        → goapp 所在目录（默认根）
+//   GET /dir?path=/                 → Linux 根目录
+//   GET /dir?path=/etc              → 任意绝对路径
+//   GET /dir?path=..                → 上级目录（相对路径转绝对）
+//   GET /dir?path=/foo/bar.txt      → 文本文件：弹窗预览（前端 fetch）
+//   GET /dir?path=/foo/bar.txt&raw=1 → 返回纯文本内容（供 fetch 读取）
+//   GET /dir?path=/foo/bar.bin      → 二进制文件：直接下载
 //
-// 安全：requireLogin 保护；路径用 filepath.Clean 规范化；无路径白名单限制
+// 安全：requireLogin 保护；filepath.Clean 规范化路径
 // ─────────────────────────────────────────────────────────────────────────────
 
-// dirDefaultRoot 返回 goapp 程序所在目录（默认起始目录）
+// dirDefaultRoot 返回 goapp 程序所在目录
 func dirDefaultRoot() string {
 	exe, err := os.Executable()
 	if err != nil {
@@ -37,18 +39,40 @@ func dirDefaultRoot() string {
 	return filepath.Dir(real)
 }
 
+// isTextFile 根据扩展名判断是否为文本类文件（弹窗预览）
+func isTextFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	switch ext {
+	case ".go", ".js", ".ts", ".jsx", ".tsx",
+		".py", ".rb", ".php", ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".rs", ".swift",
+		".sh", ".bash", ".zsh", ".fish",
+		".txt", ".md", ".markdown", ".rst",
+		".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".env",
+		".xml", ".html", ".htm", ".css", ".scss", ".less",
+		".sql", ".graphql",
+		".log", ".csv",
+		".dockerfile", ".makefile", ".gitignore", ".gitattributes",
+		".mod", ".sum", ".lock":
+		return true
+	}
+	// 无扩展名的常见文本文件
+	base := strings.ToLower(filepath.Base(name))
+	switch base {
+	case "dockerfile", "makefile", "readme", "license", "changelog",
+		"gemfile", "rakefile", "procfile":
+		return true
+	}
+	return false
+}
+
 // handleDir 处理 /dir 请求
 func handleDir(w http.ResponseWriter, r *http.Request) {
-	// 解析目标路径
 	targetPath := r.URL.Query().Get("path")
 	if targetPath == "" {
-		// 默认：goapp 所在目录
 		targetPath = dirDefaultRoot()
 	} else if !filepath.IsAbs(targetPath) {
-		// 相对路径：相对于 goapp 根目录解析
 		targetPath = filepath.Join(dirDefaultRoot(), targetPath)
 	}
-	// 规范化（处理 .. / . / 多余斜杠）
 	targetPath = filepath.Clean(targetPath)
 
 	fi, err := os.Stat(targetPath)
@@ -59,8 +83,17 @@ func handleDir(w http.ResponseWriter, r *http.Request) {
 
 	if fi.IsDir() {
 		renderDirListing(w, r, targetPath)
+		return
+	}
+
+	// 文件处理
+	raw := r.URL.Query().Get("raw") == "1"
+	if raw {
+		// raw=1：返回纯文本内容（供前端 fetch 读取后弹窗展示）
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		http.ServeFile(w, r, targetPath)
 	} else {
-		// 文件：触发下载
+		// 普通访问：触发下载
 		w.Header().Set("Content-Disposition",
 			fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(targetPath)))
 		http.ServeFile(w, r, targetPath)
@@ -75,7 +108,6 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 		return
 	}
 
-	// 分离目录和文件，分别排序
 	var dirs, files []os.DirEntry
 	for _, e := range entries {
 		if e.IsDir() {
@@ -87,15 +119,13 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
 	sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
 
-	// 构建面包屑导航（基于绝对路径，每段可点击）
 	breadcrumb := buildAbsBreadcrumb(absPath)
 
-	// 构建表格行 HTML
 	var rows strings.Builder
 
-	// 上级目录（.. 条目，始终显示，除非已在文件系统根 /）
+	// 上级目录 ..（已在根 / 时不显示）
 	parent := filepath.Dir(absPath)
-	if parent != absPath { // filepath.Dir("/") == "/"，相等时说明已在根
+	if parent != absPath {
 		parentURL := "/dir?path=" + urlEncodePath(parent)
 		rows.WriteString(fmt.Sprintf(`
 		<tr class="dir-row">
@@ -131,7 +161,7 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 	// 文件行
 	for _, e := range files {
 		name := e.Name()
-		href := "/dir?path=" + urlEncodePath(filepath.Join(absPath, name))
+		filePath := filepath.Join(absPath, name)
 		info, _ := e.Info()
 		size := ""
 		modTime := ""
@@ -139,16 +169,45 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 			size = formatFileSize(info.Size())
 			modTime = info.ModTime().Format("2006-01-02 15:04:05")
 		}
+
+		isText := isTextFile(name)
+		rawURL := "/dir?path=" + urlEncodePath(filePath) + "&raw=1"
+		dlURL := "/dir?path=" + urlEncodePath(filePath)
+
+		var linkHTML string
+		if isText {
+			// 文本文件：点击触发 JS 弹窗预览
+			linkHTML = fmt.Sprintf(
+				`<a href="#" class="file-link text-preview" data-raw="%s" data-name="%s">%s</a>`,
+				html.EscapeString(rawURL),
+				html.EscapeString(name),
+				html.EscapeString(name),
+			)
+		} else {
+			// 二进制文件：直接下载
+			linkHTML = fmt.Sprintf(
+				`<a href="%s" class="file-link" download>%s</a>`,
+				html.EscapeString(dlURL),
+				html.EscapeString(name),
+			)
+		}
+
+		// 下载按钮（文本文件也提供下载入口）
+		dlBtn := fmt.Sprintf(
+			`<a href="%s" class="dl-btn" download title="下载">⬇</a>`,
+			html.EscapeString(dlURL),
+		)
+
 		rows.WriteString(fmt.Sprintf(`
 		<tr class="file-row">
 			<td class="icon-cell">%s</td>
-			<td><a href="%s" class="file-link" download>%s</a></td>
+			<td class="name-cell">%s %s</td>
 			<td class="meta size">%s</td>
 			<td class="meta">%s</td>
 		</tr>`,
 			fileIcon(name),
-			html.EscapeString(href),
-			html.EscapeString(name),
+			linkHTML,
+			dlBtn,
 			html.EscapeString(size),
 			html.EscapeString(modTime),
 		))
@@ -158,24 +217,20 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, dirHTML,
-		html.EscapeString(absPath), // 页面标题
-		breadcrumb,                 // 面包屑 HTML
-		html.EscapeString(absPath), // 路径栏
-		summary,                    // 统计
-		rows.String(),              // 表格行
+		html.EscapeString(absPath),
+		breadcrumb,
+		html.EscapeString(absPath),
+		summary,
+		rows.String(),
 	)
 }
 
 // buildAbsBreadcrumb 根据绝对路径构建可点击面包屑
-// 例：/home/user/goapp → 🏠 / ›  home ›  user ›  goapp（每段可点击）
 func buildAbsBreadcrumb(absPath string) string {
 	var b strings.Builder
-
-	// Linux 根目录 /
 	rootURL := "/dir?path=/"
 	b.WriteString(fmt.Sprintf(`<a href="%s" class="crumb">🖥️ /</a>`, html.EscapeString(rootURL)))
 
-	// 拆分路径各段（去掉开头的空字符串）
 	parts := strings.Split(strings.TrimPrefix(absPath, "/"), "/")
 	cumPath := ""
 	for i, part := range parts {
@@ -185,7 +240,6 @@ func buildAbsBreadcrumb(absPath string) string {
 		cumPath += "/" + part
 		b.WriteString(` <span class="crumb-sep">›</span> `)
 		if i == len(parts)-1 {
-			// 最后一段：当前目录，不加链接（加粗高亮）
 			b.WriteString(fmt.Sprintf(`<span class="crumb-cur">%s</span>`, html.EscapeString(part)))
 		} else {
 			href := "/dir?path=" + urlEncodePath(cumPath)
@@ -196,9 +250,8 @@ func buildAbsBreadcrumb(absPath string) string {
 	return b.String()
 }
 
-// urlEncodePath 对路径做 URL 编码（保留 /，对其他特殊字符编码）
+// urlEncodePath 对路径做 URL 编码（保留 /，编码其他特殊字符）
 func urlEncodePath(p string) string {
-	// 手动编码：只编码空格和特殊字符，保留路径分隔符 /
 	var b strings.Builder
 	for _, c := range p {
 		switch {
@@ -212,7 +265,7 @@ func urlEncodePath(p string) string {
 	return b.String()
 }
 
-// formatFileSize 将字节数格式化为人类可读的字符串
+// formatFileSize 将字节数格式化为人类可读字符串
 func formatFileSize(size int64) string {
 	const (
 		KB = 1024
@@ -231,7 +284,7 @@ func formatFileSize(size int64) string {
 	}
 }
 
-// fileIcon 根据文件扩展名返回对应 emoji 图标
+// fileIcon 根据文件扩展名返回 emoji 图标
 func fileIcon(name string) string {
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
@@ -348,17 +401,123 @@ const dirHTML = `<!DOCTYPE html>
   .dir-table td { padding: 9px 14px; font-size: 0.85rem; vertical-align: middle; }
 
   .icon-cell { width: 36px; text-align: center; font-size: 1.1rem; }
+  .name-cell { display: flex; align-items: center; gap: 8px; }
 
   .dir-link { color: #93c5fd; text-decoration: none; font-weight: 500; }
   .dir-link:hover { text-decoration: underline; color: #60a5fa; }
 
   .file-link { color: #e2e8f0; text-decoration: none; }
   .file-link:hover { color: #60a5fa; text-decoration: underline; }
+  .file-link.text-preview { color: #a5f3fc; cursor: pointer; }
+  .file-link.text-preview:hover { color: #22d3ee; text-decoration: underline; }
+
+  /* 下载按钮 */
+  .dl-btn {
+    color: #475569; text-decoration: none; font-size: 0.8rem;
+    padding: 1px 5px; border-radius: 4px; border: 1px solid #334155;
+    transition: all 0.15s; white-space: nowrap;
+  }
+  .dl-btn:hover { background: #1e3a5f; color: #93c5fd; border-color: #2563eb; }
 
   .meta { color: #64748b; font-size: 0.78rem; }
   .size { font-family: monospace; color: #94a3b8; }
 
-  .empty { text-align: center; padding: 48px; color: #475569; font-size: 0.9rem; }
+  /* ── 预览弹窗 ── */
+  dialog {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 14px;
+    padding: 0;
+    width: min(90vw, 900px);
+    max-height: 85vh;
+    color: #e2e8f0;
+    box-shadow: 0 25px 60px rgba(0,0,0,0.6);
+    display: flex;
+    flex-direction: column;
+  }
+  dialog::backdrop { background: rgba(0,0,0,0.65); backdrop-filter: blur(3px); }
+  .dialog-header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 14px 20px;
+    border-bottom: 1px solid #334155;
+    background: #0f172a;
+    border-radius: 14px 14px 0 0;
+    flex-shrink: 0;
+  }
+  .dialog-title {
+    font-size: 0.9rem; color: #93c5fd; font-family: monospace;
+    flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dialog-dl-btn {
+    background: #1e3a5f; color: #93c5fd;
+    border: 1px solid #2563eb; border-radius: 7px;
+    padding: 5px 12px; font-size: 0.78rem; text-decoration: none;
+    white-space: nowrap; transition: background 0.15s;
+  }
+  .dialog-dl-btn:hover { background: #2563eb; color: #fff; }
+  .dialog-close {
+    background: none; border: none; color: #64748b;
+    font-size: 1.3rem; cursor: pointer; padding: 2px 6px;
+    border-radius: 6px; transition: all 0.15s; line-height: 1;
+  }
+  .dialog-close:hover { background: #334155; color: #e2e8f0; }
+  .dialog-body {
+    overflow: auto;
+    flex: 1;
+    padding: 0;
+  }
+  .dialog-loading {
+    padding: 48px; text-align: center; color: #475569; font-size: 0.9rem;
+  }
+  .dialog-error {
+    padding: 24px; color: #f87171; font-size: 0.85rem;
+    background: #3b1a1a; margin: 16px; border-radius: 8px;
+  }
+  pre.file-content {
+    margin: 0;
+    padding: 20px 24px;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: #e2e8f0;
+    white-space: pre-wrap;
+    word-break: break-all;
+    tab-size: 4;
+  }
+  .line-nums {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0;
+  }
+  .line-num-col {
+    padding: 20px 12px 20px 20px;
+    text-align: right;
+    color: #334155;
+    font-family: monospace;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    user-select: none;
+    border-right: 1px solid #1e293b;
+    background: #0f172a;
+    white-space: pre;
+  }
+  .line-code-col {
+    padding: 20px 20px 20px 16px;
+    font-family: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', monospace;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-all;
+    tab-size: 4;
+  }
+  .dialog-footer {
+    padding: 8px 20px;
+    border-top: 1px solid #1e293b;
+    font-size: 0.75rem;
+    color: #475569;
+    flex-shrink: 0;
+    display: flex; gap: 16px;
+  }
 
   @media (max-width: 640px) {
     main { padding: 16px; }
@@ -366,6 +525,7 @@ const dirHTML = `<!DOCTYPE html>
     .breadcrumb { padding: 10px 16px; }
     .dir-table thead th:nth-child(3),
     .dir-table td:nth-child(3) { display: none; }
+    dialog { width: 98vw; max-height: 92vh; }
   }
 </style>
 </head>
@@ -401,6 +561,101 @@ const dirHTML = `<!DOCTYPE html>
     </tbody>
   </table>
 </main>
+
+<!-- 文本预览弹窗 -->
+<dialog id="previewDialog">
+  <div class="dialog-header">
+    <span style="font-size:1.1rem">📄</span>
+    <span class="dialog-title" id="dialogTitle">—</span>
+    <a href="#" class="dialog-dl-btn" id="dialogDlBtn" download>⬇ 下载</a>
+    <button class="dialog-close" id="dialogClose" title="关闭 (Esc)">✕</button>
+  </div>
+  <div class="dialog-body" id="dialogBody">
+    <div class="dialog-loading">加载中…</div>
+  </div>
+  <div class="dialog-footer" id="dialogFooter"></div>
+</dialog>
+
+<script>
+(function () {
+  const dialog = document.getElementById('previewDialog');
+  const dialogTitle = document.getElementById('dialogTitle');
+  const dialogBody = document.getElementById('dialogBody');
+  const dialogDlBtn = document.getElementById('dialogDlBtn');
+  const dialogFooter = document.getElementById('dialogFooter');
+  const dialogClose = document.getElementById('dialogClose');
+
+  // 关闭弹窗
+  dialogClose.addEventListener('click', () => dialog.close());
+  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape' && dialog.open) dialog.close(); });
+
+  // 点击文本文件链接
+  document.addEventListener('click', async function (e) {
+    const link = e.target.closest('.text-preview');
+    if (!link) return;
+    e.preventDefault();
+
+    const rawURL = link.dataset.raw;
+    const fileName = link.dataset.name;
+    const dlURL = rawURL.replace('&raw=1', '');
+
+    // 打开弹窗，显示加载状态
+    dialogTitle.textContent = fileName;
+    dialogDlBtn.href = dlURL;
+    dialogDlBtn.download = fileName;
+    dialogBody.innerHTML = '<div class="dialog-loading">⏳ 加载中…</div>';
+    dialogFooter.textContent = '';
+    dialog.showModal();
+
+    try {
+      const resp = await fetch(rawURL);
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      const text = await resp.text();
+
+      // 行号 + 代码
+      const lines = text.split('\n');
+      // 末尾空行不计入行号
+      const lineCount = lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+
+      const numCol = document.createElement('div');
+      numCol.className = 'line-num-col';
+      numCol.textContent = Array.from({length: lineCount}, (_, i) => i + 1).join('\n');
+
+      const codeCol = document.createElement('div');
+      codeCol.className = 'line-code-col';
+      codeCol.textContent = text;
+
+      const grid = document.createElement('div');
+      grid.className = 'line-nums';
+      grid.appendChild(numCol);
+      grid.appendChild(codeCol);
+
+      dialogBody.innerHTML = '';
+      dialogBody.appendChild(grid);
+
+      // 页脚信息
+      const bytes = new TextEncoder().encode(text).length;
+      dialogFooter.textContent =
+        lineCount + ' 行  ·  ' + formatSize(bytes) + '  ·  ' + fileName;
+
+    } catch (err) {
+      dialogBody.innerHTML =
+        '<div class="dialog-error">❌ 加载失败：' + escHtml(err.message) + '</div>';
+    }
+  });
+
+  function formatSize(bytes) {
+    if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+    if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return bytes + ' B';
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+})();
+</script>
 
 </body>
 </html>
