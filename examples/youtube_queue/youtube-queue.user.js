@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        YouTube 投递到 GoQueue 队列
 // @namespace   https://github.com/deepseekretro/go-queue-sqlite
-// @version     1.4.0
+// @version     1.5.0
 // @description 在 YouTube 首页/频道/搜索页/播放页添加「加入队列」按钮，点击后将视频信息投递到 GoQueue 任务队列
 // @author      GoQueue
 // @match       https://www.youtube.com/
@@ -401,57 +401,100 @@
 
   // ─── 🖥️ 页面插入逻辑 ──────────────────────────────────────────────────────
   // ─── 📊 卡片元数据提取（views / 发布时间 / 频道名 / 频道链接）────────────
+  //
+  // 覆盖两种 YouTube 卡片 DOM 结构：
+  //
+  // A. 新版 lockup UI（ytd-rich-item-renderer[lockup]，驼峰式类名）
+  //    频道: a[href^="/@"]
+  //    views/time: .ytContentMetadataViewModelMetadataRow span.ytContentMetadataViewModelMetadataText
+  //
+  // B. 旧版 ytd-rich-grid-media（mini-mode，byline-container 可能 hidden）
+  //    频道: #channel-name a，或 a#avatar-link[href^="/"]（非 undefined）
+  //    views/time: #metadata-line span.inline-metadata-item（第1个=views，第2个=time）
+  //
+  // 策略：每个字段独立尝试所有选择器，只要字段为空就继续尝试下一个
+  //
   function extractCardMeta(card) {
     const meta = { views: '', publishedAt: '', channelName: '', channelUrl: '' };
 
-    // 频道名 + 频道链接
-    // 真实 DOM: <a href="/@7techlife">Seven科技生活</a>
-    const channelSelectors = [
-      'a[href^="/@"]',                          // 2025+ 驼峰式（实测）
-      'a.ytd-channel-name',
-      'yt-formatted-string.ytd-channel-name a',
-      '#channel-name a',
+    // ── 频道名 + 频道链接 ──────────────────────────────────────────────────
+    // A. 新版 lockup：<a href="/@channelId">频道名</a>
+    const channelLinkSelectors = [
+      'a[href^="/@"]',                                    // 新版 lockup（实测）
+      '.ytLockupMetadataViewModelTextContainer a[href^="/@"]',
+      '.ytContentMetadataViewModelMetadataText a[href^="/@"]',
+      // B. 旧版 ytd-rich-grid-media
+      '#channel-name a[href]',                            // byline-container 内
+      'ytd-channel-name a[href]',
+      '#attributed-channel-name a[href]',
       '.ytd-video-meta-block a[href^="/@"]',
     ];
-    for (const sel of channelSelectors) {
+    for (const sel of channelLinkSelectors) {
       const a = card.querySelector(sel);
-      if (a && a.textContent.trim()) {
-        meta.channelName = a.textContent.trim();
-        // 转为绝对 URL
-        meta.channelUrl = a.href || ('https://www.youtube.com' + a.getAttribute('href'));
-        break;
-      }
-    }
-
-    // 观看数 + 发布时间
-    // 真实 DOM: 第二个 .ytContentMetadataViewModelMetadataRow 里
-    //   span[0] = "4.8K views"  span[2] = "6 hours ago"
-    const rows = card.querySelectorAll('.ytContentMetadataViewModelMetadataRow');
-    // 找包含 "views" 或 "watching" 的 row
-    for (const row of rows) {
-      const spans = row.querySelectorAll('.ytContentMetadataViewModelMetadataText');
-      for (let i = 0; i < spans.length; i++) {
-        const text = spans[i].textContent.trim();
-        if (/views?|watching/i.test(text)) {
-          meta.views = text;
-          // 发布时间通常在同一 row 的下一个 span
-          if (spans[i + 1]) meta.publishedAt = spans[i + 1].textContent.trim();
-          else if (spans[i - 1] && !/views?/i.test(spans[i - 1].textContent))
-            meta.publishedAt = spans[i - 1].textContent.trim();
+      if (a) {
+        const name = a.textContent.trim();
+        const href = a.getAttribute('href') || '';
+        // 过滤掉无效的 href（"undefined"、空、非频道路径）
+        if (name && href && href !== 'undefined' && (href.startsWith('/@') || href.startsWith('/channel') || href.startsWith('/user'))) {
+          meta.channelName = name;
+          meta.channelUrl = a.href || ('https://www.youtube.com' + href);
           break;
         }
       }
-      if (meta.views) break;
+    }
+    // 频道名兜底：#channel-name 的 title 属性或 textContent（无链接时）
+    if (!meta.channelName) {
+      const cnEl = card.querySelector('#channel-name yt-formatted-string#text, #channel-name #text');
+      if (cnEl) {
+        const t = cnEl.title || cnEl.textContent.trim();
+        if (t && t !== 'undefined') meta.channelName = t;
+      }
     }
 
-    // 兜底：旧版 #metadata-line 等
-    if (!meta.views) {
-      const viewEl = card.querySelector('#metadata-line span:first-child, .ytd-video-meta-block span:first-child');
-      if (viewEl) meta.views = viewEl.textContent.trim();
+    // ── 观看数 + 发布时间 ──────────────────────────────────────────────────
+    // A. 新版 lockup：.ytContentMetadataViewModelMetadataRow
+    if (!meta.views || !meta.publishedAt) {
+      const rows = card.querySelectorAll('.ytContentMetadataViewModelMetadataRow');
+      for (const row of rows) {
+        const spans = row.querySelectorAll('.ytContentMetadataViewModelMetadataText');
+        for (let i = 0; i < spans.length; i++) {
+          const text = spans[i].textContent.trim();
+          if (/\d.*views?|watching/i.test(text)) {
+            if (!meta.views) meta.views = text;
+            // 发布时间在同一 row 的相邻 span
+            if (!meta.publishedAt && spans[i + 1]) meta.publishedAt = spans[i + 1].textContent.trim();
+            if (!meta.publishedAt && i > 0 && !/views?/i.test(spans[i - 1].textContent))
+              meta.publishedAt = spans[i - 1].textContent.trim();
+            break;
+          }
+        }
+        if (meta.views) break;
+      }
     }
-    if (!meta.publishedAt) {
-      const timeEl = card.querySelector('#metadata-line span:last-child, .ytd-video-meta-block span:last-child');
-      if (timeEl) meta.publishedAt = timeEl.textContent.trim();
+
+    // B. 旧版 ytd-rich-grid-media：#metadata-line span.inline-metadata-item
+    //    第1个 span = views（"282 views"），第2个 span = time（"1 hour ago"）
+    if (!meta.views || !meta.publishedAt) {
+      const metaItems = card.querySelectorAll('#metadata-line span.inline-metadata-item');
+      for (const span of metaItems) {
+        const text = span.textContent.trim();
+        if (!meta.views && /\d.*views?|watching/i.test(text)) {
+          meta.views = text;
+        } else if (!meta.publishedAt && meta.views && text && !/^\s*$/.test(text)) {
+          // 第一个非 views 的 span 就是时间
+          meta.publishedAt = text;
+        }
+      }
+      // 如果没有 views 但有两个 span，第1个=views，第2个=time（兜底）
+      if (!meta.views && metaItems.length >= 1) meta.views = metaItems[0]?.textContent.trim() || '';
+      if (!meta.publishedAt && metaItems.length >= 2) meta.publishedAt = metaItems[1]?.textContent.trim() || '';
+    }
+
+    // C. 更通用兜底：ytd-video-meta-block 内任意 inline-metadata-item
+    if (!meta.views || !meta.publishedAt) {
+      const metaItems = card.querySelectorAll('ytd-video-meta-block span.inline-metadata-item');
+      if (!meta.views && metaItems.length >= 1) meta.views = metaItems[0]?.textContent.trim() || '';
+      if (!meta.publishedAt && metaItems.length >= 2) meta.publishedAt = metaItems[1]?.textContent.trim() || '';
     }
 
     return meta;
