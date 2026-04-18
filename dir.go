@@ -219,7 +219,6 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 	fmt.Fprintf(w, dirHTML,
 		html.EscapeString(absPath),
 		breadcrumb,
-		html.EscapeString(absPath),
 		summary,
 		rows.String(),
 	)
@@ -233,19 +232,16 @@ func buildAbsBreadcrumb(absPath string) string {
 
 	parts := strings.Split(strings.TrimPrefix(absPath, "/"), "/")
 	cumPath := ""
-	for i, part := range parts {
+	for _, part := range parts {
 		if part == "" {
 			continue
 		}
 		cumPath += "/" + part
 		b.WriteString(` <span class="crumb-sep">›</span> `)
-		if i == len(parts)-1 {
-			b.WriteString(fmt.Sprintf(`<span class="crumb-cur">%s</span>`, html.EscapeString(part)))
-		} else {
-			href := "/dir?path=" + urlEncodePath(cumPath)
-			b.WriteString(fmt.Sprintf(`<a href="%s" class="crumb">%s</a>`,
-				html.EscapeString(href), html.EscapeString(part)))
-		}
+		// 每一段都是可点击链接（包括最后一段/当前目录）
+		href := "/dir?path=" + urlEncodePath(cumPath)
+		b.WriteString(fmt.Sprintf(`<a href="%s" class="crumb">%s</a>`,
+			html.EscapeString(href), html.EscapeString(part)))
 	}
 	return b.String()
 }
@@ -351,27 +347,19 @@ const dirHTML = `<!DOCTYPE html>
   header .back-btn:hover { background: #2563eb; color: #fff; }
 
   .breadcrumb {
-    padding: 12px 32px;
+    padding: 10px 32px;
     background: #0f172a;
     border-bottom: 1px solid #1e293b;
     font-size: 0.85rem;
     display: flex; flex-wrap: wrap; align-items: center; gap: 2px;
   }
-  .crumb { color: #60a5fa; text-decoration: none; padding: 2px 4px; border-radius: 4px; }
+  .crumb-nav { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; flex: 1; }
+  .crumb-summary { margin-left: auto; color: #475569; font-size: 0.78rem; white-space: nowrap; padding-left: 16px; }
+  .crumb { color: #60a5fa; text-decoration: none; padding: 2px 6px; border-radius: 4px; }
   .crumb:hover { background: #1e293b; text-decoration: underline; }
-  .crumb-sep { color: #475569; margin: 0 2px; }
-  .crumb-cur { color: #e2e8f0; font-weight: 600; padding: 2px 4px; }
+  .crumb-sep { color: #475569; margin: 0 1px; }
 
   main { padding: 24px 32px; }
-
-  .path-bar {
-    background: #1e293b; border: 1px solid #334155; border-radius: 10px;
-    padding: 10px 16px; margin-bottom: 20px;
-    font-size: 0.82rem; color: #94a3b8;
-    display: flex; align-items: center; gap: 8px;
-  }
-  .path-bar .path-text { color: #60a5fa; font-family: monospace; word-break: break-all; }
-  .path-bar .summary { margin-left: auto; color: #64748b; white-space: nowrap; }
 
   .dir-table {
     width: 100%%;
@@ -434,8 +422,13 @@ const dirHTML = `<!DOCTYPE html>
     box-shadow: 0 25px 60px rgba(0,0,0,0.6);
     display: flex;
     flex-direction: column;
+    /* 拖拽定位 */
+    position: fixed;
+    margin: 0;
   }
   dialog::backdrop { background: rgba(0,0,0,0.65); backdrop-filter: blur(3px); }
+  .dialog-header { cursor: grab; user-select: none; }
+  .dialog-header:active { cursor: grabbing; }
   .dialog-header {
     display: flex; align-items: center; gap: 12px;
     padding: 14px 20px;
@@ -538,15 +531,12 @@ const dirHTML = `<!DOCTYPE html>
   <a href="/" class="back-btn">← 返回 Dashboard</a>
 </header>
 
-<div class="breadcrumb">%s</div>
-
-<main>
-  <div class="path-bar">
-    <span>📍</span>
-    <span class="path-text">%s</span>
-    <span class="summary">%s</span>
+<div class="breadcrumb">
+    <span class="crumb-nav">%s</span>
+    <span class="crumb-summary">%s</span>
   </div>
 
+<main>
   <table class="dir-table">
     <thead>
       <tr>
@@ -590,6 +580,41 @@ const dirHTML = `<!DOCTYPE html>
   dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && dialog.open) dialog.close(); });
 
+  // ── 拖拽移动弹窗 ──
+  // 拖拽 dialog-header 区域来移动整个 dialog
+  const dialogHeader = document.querySelector('.dialog-header');
+  let isDragging = false, dragOffsetX = 0, dragOffsetY = 0;
+
+  dialogHeader.addEventListener('mousedown', function (e) {
+    // 不拦截按钮点击
+    if (e.target.closest('button, a')) return;
+    isDragging = true;
+    const rect = dialog.getBoundingClientRect();
+    dragOffsetX = e.clientX - rect.left;
+    dragOffsetY = e.clientY - rect.top;
+    dialogHeader.style.cursor = 'grabbing';
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', function (e) {
+    if (!isDragging) return;
+    let newLeft = e.clientX - dragOffsetX;
+    let newTop  = e.clientY - dragOffsetY;
+    // 限制在视口内
+    const rect = dialog.getBoundingClientRect();
+    newLeft = Math.max(0, Math.min(newLeft, window.innerWidth  - rect.width));
+    newTop  = Math.max(0, Math.min(newTop,  window.innerHeight - rect.height));
+    dialog.style.left = newLeft + 'px';
+    dialog.style.top  = newTop  + 'px';
+  });
+
+  document.addEventListener('mouseup', function () {
+    if (isDragging) {
+      isDragging = false;
+      dialogHeader.style.cursor = '';
+    }
+  });
+
   // 点击文本文件链接
   document.addEventListener('click', async function (e) {
     const link = e.target.closest('.text-preview');
@@ -606,7 +631,14 @@ const dirHTML = `<!DOCTYPE html>
     dialogDlBtn.download = fileName;
     dialogBody.innerHTML = '<div class="dialog-loading">⏳ 加载中…</div>';
     dialogFooter.textContent = '';
+    // 居中显示（position:fixed 后需手动居中）
+    dialog.style.left = '';
+    dialog.style.top  = '';
     dialog.showModal();
+    // 计算居中位置
+    const dr = dialog.getBoundingClientRect();
+    dialog.style.left = Math.max(0, (window.innerWidth  - dr.width)  / 2) + 'px';
+    dialog.style.top  = Math.max(0, (window.innerHeight - dr.height) / 2) + 'px';
 
     try {
       const resp = await fetch(rawURL);
