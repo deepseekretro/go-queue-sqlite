@@ -25,6 +25,22 @@ import (
 
 var db *sql.DB
 
+// vacuumState 记录空闲压缩的运行状态，暴露到 /api/stats
+var vacuumState = struct {
+	lastRunAt   int64   // 上次 VACUUM 完成的 Unix 时间戳（0=从未运行）
+	lastDurMs   int64   // 上次 VACUUM 耗时（毫秒）
+	totalRuns   int64   // 累计触发次数
+	running     bool    // 当前是否正在执行 VACUUM
+	lastSizeBefore int64 // 上次 VACUUM 前 DB 文件大小（字节）
+	lastSizeAfter  int64 // 上次 VACUUM 后 DB 文件大小（字节）
+}{}
+
+// VacuumIntervalSec：自动 VACUUM 检查间隔（秒），环境变量 VACUUM_INTERVAL_SEC，默认 300
+var VacuumIntervalSec = 300
+
+// VacuumMinIdleSec：触发 VACUUM 所需的最短连续空闲时间（秒），环境变量 VACUUM_MIN_IDLE_SEC，默认 60
+var VacuumMinIdleSec = 60
+
 // ─────────────────────────────────────────────
 // DB Writer — 显式写 channel，单一 goroutine 串行执行所有写操作
 // 读操作（SELECT）直接用 db，可并发；写操作通过 dbExec/dbTxFunc 排队
@@ -564,8 +580,18 @@ func initTimeouts() {
 			DefaultJobTimeoutSec = n
 		}
 	}
-	log.Printf("[Config] Timeouts — ws_job=%ds stale=%ds default_job=%ds",
-		WsJobTimeoutSec, StaleJobTimeout, DefaultJobTimeoutSec)
+	if v := os.Getenv("VACUUM_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			VacuumIntervalSec = n
+		}
+	}
+	if v := os.Getenv("VACUUM_MIN_IDLE_SEC"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			VacuumMinIdleSec = n
+		}
+	}
+	log.Printf("[Config] Timeouts — ws_job=%ds stale=%ds default_job=%ds vacuum_interval=%ds vacuum_min_idle=%ds",
+		WsJobTimeoutSec, StaleJobTimeout, DefaultJobTimeoutSec, VacuumIntervalSec, VacuumMinIdleSec)
 }
 
 // workerWg 追踪所有正在执行的 GoWorker goroutine，优雅关闭时等待它们完成
@@ -1081,6 +1107,209 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 // startStaleJobReaper 每 30s 扫描一次：
 // 把 status='running' 且超过 StaleJobTimeout 秒未更新的任务放回 pending
 // 这能恢复服务崩溃、WS 断连未处理等场景下卡住的任务
+// ─────────────────────────────────────────────────────────────────────────────
+// Idle VACUUM — 空闲时自动压缩 SQLite 数据库，回收已删除行占用的磁盘空间
+// ─────────────────────────────────────────────────────────────────────────────
+
+// isSystemIdle 判断系统当前是否空闲：
+//   - DB 中无 pending / running 任务
+//   - insertCoalesceCh / doneCoalesceCh / dbArbiterCh 均无积压
+func isSystemIdle() bool {
+	var pending, running int
+	db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE status='pending'`).Scan(&pending)
+	db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE status='running'`).Scan(&running)
+	if pending > 0 || running > 0 {
+		return false
+	}
+	if len(insertCoalesceCh) > 0 || len(doneCoalesceCh) > 0 || len(dbArbiterCh) > 0 {
+		return false
+	}
+	return true
+}
+
+// dbFilePath 返回当前 DB 文件路径（从连接字符串解析）
+func dbFilePath() string {
+	// 连接字符串格式：./queue.db?...
+	return "./queue.db"
+}
+
+// dbFileSize 返回 DB 的逻辑大小（page_count × page_size，字节）。
+// 使用 PRAGMA 而非 os.Stat，因为 WAL 模式下 VACUUM 后主文件的物理大小
+// 不会立即缩小（mmap 延迟），但 page_count 会立即反映压缩后的真实页数。
+// 注意：此函数必须在 dbArbiterCh 的 fn() 内部调用（持有写锁时），
+//       或在只读场景下调用（读取 page_count 是只读操作）。
+func dbFileSize() int64 {
+	var pageCount, pageSize int64
+	if err := db.QueryRow(`PRAGMA page_count`).Scan(&pageCount); err != nil {
+		// 降级：用 os.Stat
+		fi, err2 := os.Stat(dbFilePath())
+		if err2 != nil {
+			return -1
+		}
+		return fi.Size()
+	}
+	if err := db.QueryRow(`PRAGMA page_size`).Scan(&pageSize); err != nil || pageSize == 0 {
+		pageSize = 4096
+	}
+	return pageCount * pageSize
+}
+
+// runVacuum 执行一次完整的 SQLite 压缩：
+//  1. wal_checkpoint(TRUNCATE)：把旧 WAL 合并回主文件并截断
+//  2. VACUUM：重建主文件，回收碎片空间（VACUUM 的输出写入新 WAL）
+//  3. wal_checkpoint(TRUNCATE)：把 VACUUM 产生的新 WAL 合并回主文件并截断
+//
+// 三步完成后，主文件即为压缩后的真实大小，WAL 被清空。
+// 通过 dbArbiterCh 串行执行，保证不与其他写操作并发。
+// 返回 (sizeBefore, sizeAfter, durationMs, error)
+func runVacuum() (int64, int64, int64, error) {
+	type vacResult struct {
+		sizeBefore int64
+		sizeAfter  int64
+		durMs      int64
+		err        error
+	}
+	resultCh := make(chan vacResult, 1)
+
+	dbArbiterCh <- dbWriteReq{
+		fn: func() error {
+			t0 := time.Now()
+			sizeBefore := dbFileSize()
+
+			// Step 1: 把旧 WAL 合并回主文件并截断
+			if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+				resultCh <- vacResult{sizeBefore, -1, 0, fmt.Errorf("pre-checkpoint: %w", err)}
+				return err
+			}
+
+			// Step 2: VACUUM — 重建主文件，回收碎片（输出写入新 WAL）
+			if _, err := db.Exec(`VACUUM`); err != nil {
+				resultCh <- vacResult{sizeBefore, -1, 0, fmt.Errorf("vacuum: %w", err)}
+				return err
+			}
+
+			// Step 3: 把 VACUUM 产生的新 WAL 合并回主文件并截断
+			// 完成后主文件即为压缩后的真实大小
+			if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+				resultCh <- vacResult{sizeBefore, -1, 0, fmt.Errorf("post-checkpoint: %w", err)}
+				return err
+			}
+
+			sizeAfter := dbFileSize()
+			durMs := time.Since(t0).Milliseconds()
+			resultCh <- vacResult{sizeBefore, sizeAfter, durMs, nil}
+			return nil
+		},
+		result: nil, // fire-and-forget to arbiter; result comes via resultCh
+	}
+
+	r := <-resultCh
+	return r.sizeBefore, r.sizeAfter, r.durMs, r.err
+}
+
+// startIdleVacuumer 启动空闲压缩 goroutine：
+//   - 每 VacuumIntervalSec 秒检查一次系统是否空闲
+//   - 连续 2 次检查均空闲（即空闲时间 >= VacuumMinIdleSec）才触发 VACUUM
+//   - 触发后更新 vacuumState，日志记录压缩前后文件大小
+//   - 环境变量：VACUUM_INTERVAL_SEC（默认 300）、VACUUM_MIN_IDLE_SEC（默认 60）
+func startIdleVacuumer() {
+	go func() {
+		idleCount := 0 // 连续空闲检查次数
+		for {
+			time.Sleep(time.Duration(VacuumIntervalSec) * time.Second)
+
+			// 跳过：正在执行 VACUUM
+			if vacuumState.running {
+				idleCount = 0
+				continue
+			}
+
+			if isSystemIdle() {
+				idleCount++
+			} else {
+				idleCount = 0
+				continue
+			}
+
+			// 需要连续 2 次空闲（即空闲时间 >= VacuumMinIdleSec）才触发
+			requiredIdle := max(2, (VacuumMinIdleSec/VacuumIntervalSec)+1)
+			if idleCount < requiredIdle {
+				log.Printf("[Vacuumer] System idle (%d/%d checks), waiting...", idleCount, requiredIdle)
+				continue
+			}
+
+			// 触发 VACUUM
+			idleCount = 0
+			vacuumState.running = true
+			log.Printf("[Vacuumer] System idle — starting VACUUM (db_size=%d bytes)", dbFileSize())
+
+			sizeBefore, sizeAfter, durMs, err := runVacuum()
+			vacuumState.running = false
+
+			if err != nil {
+				log.Printf("[Vacuumer] VACUUM failed: %v", err)
+				continue
+			}
+
+			vacuumState.lastRunAt = time.Now().Unix()
+			vacuumState.lastDurMs = durMs
+			vacuumState.totalRuns++
+			vacuumState.lastSizeBefore = sizeBefore
+			vacuumState.lastSizeAfter = sizeAfter
+
+			saved := sizeBefore - sizeAfter
+			log.Printf("[Vacuumer] VACUUM done in %dms — %d → %d bytes (saved %d bytes, %.1f%%)",
+				durMs, sizeBefore, sizeAfter, saved,
+				func() float64 {
+					if sizeBefore <= 0 {
+						return 0
+					}
+					return float64(saved) / float64(sizeBefore) * 100
+				}())
+		}
+	}()
+	log.Printf("[Vacuumer] Started — check_interval=%ds min_idle=%ds (env: VACUUM_INTERVAL_SEC, VACUUM_MIN_IDLE_SEC)",
+		VacuumIntervalSec, VacuumMinIdleSec)
+}
+
+// handleAdminVacuum 处理 POST /api/admin/vacuum 手动触发压缩请求
+func handleAdminVacuum(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonResp(w, 405, map[string]string{"error": "method not allowed, use POST"})
+		return
+	}
+	if vacuumState.running {
+		jsonResp(w, 409, map[string]string{"error": "vacuum already running"})
+		return
+	}
+
+	vacuumState.running = true
+	log.Printf("[Vacuumer] Manual VACUUM triggered via API (db_size=%d bytes)", dbFileSize())
+
+	// 异步执行，立即返回 202 Accepted
+	go func() {
+		sizeBefore, sizeAfter, durMs, err := runVacuum()
+		vacuumState.running = false
+		if err != nil {
+			log.Printf("[Vacuumer] Manual VACUUM failed: %v", err)
+			return
+		}
+		vacuumState.lastRunAt = time.Now().Unix()
+		vacuumState.lastDurMs = durMs
+		vacuumState.totalRuns++
+		vacuumState.lastSizeBefore = sizeBefore
+		vacuumState.lastSizeAfter = sizeAfter
+		saved := sizeBefore - sizeAfter
+		log.Printf("[Vacuumer] Manual VACUUM done in %dms — saved %d bytes", durMs, saved)
+	}()
+
+	jsonResp(w, 202, map[string]interface{}{
+		"status":  "accepted",
+		"message": "VACUUM started in background",
+		"db_size_before": dbFileSize(),
+	})
+}
+
 func startStaleJobReaper() {
 	go func() {
 		for {
@@ -1444,6 +1673,17 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		stats["queue_pending"] = queuePending
 	}
 
+	// vacuum 状态
+	stats["vacuum"] = map[string]interface{}{
+		"running":          vacuumState.running,
+		"total_runs":       vacuumState.totalRuns,
+		"last_run_at":      vacuumState.lastRunAt,
+		"last_dur_ms":      vacuumState.lastDurMs,
+		"last_size_before": vacuumState.lastSizeBefore,
+		"last_size_after":  vacuumState.lastSizeAfter,
+		"db_size_now":      dbFileSize(),
+	}
+
 	jsonResp(w, 200, stats)
 }
 
@@ -1663,6 +1903,7 @@ func main() {
 
 	startStaleJobReaper()
 	startHeartbeatReaper()
+	startIdleVacuumer()    // 空闲时自动压缩 SQLite
 	startSessionReaper()
 	// 内置 GoWorker 已移除 — 任务由外部 WS Worker 处理
 	// 启动动态 WsDispatcher（自动感知所有有 WS Worker 连接的队列）
@@ -1752,6 +1993,7 @@ func main() {
 	mux.HandleFunc("/api/backend", cors(auth(handleBackendInfo)))    // P3-2: 后端信息
 	mux.HandleFunc("/api/autoscale", cors(auth(handleAutoScale)))    // P3-3: 动态扩缩容
 	mux.HandleFunc("/api/stats", cors(auth(handleStats)))
+	mux.HandleFunc("/api/admin/vacuum", cors(auth(handleAdminVacuum))) // 手动触发 VACUUM
 	mux.HandleFunc("/api/db/reset", cors(auth(handleDBReset)))
 	mux.HandleFunc("/api/me", requireLogin(handleMe))
 	mux.HandleFunc("/api/events", requireLogin(handleSSE))
