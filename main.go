@@ -1911,17 +1911,9 @@ func main() {
 
 	mux := http.NewServeMux()
 	// API 鉴权中间件：读取环境变量 API_KEY，若设置则要求请求携带 X-API-Key header
-	apiKey := os.Getenv("API_KEY")
+	// 鉴权已禁用（无需 API_KEY）
 	auth := func(h http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			if apiKey != "" && r.Header.Get("X-API-Key") != apiKey {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(401)
-				w.Write([]byte(`{"error":"unauthorized: invalid or missing X-API-Key"}`))
-				return
-			}
-			h(w, r)
-		}
+		return h
 	}
 
 	cors := func(h http.HandlerFunc) http.HandlerFunc {

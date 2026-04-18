@@ -27,7 +27,11 @@
    - 7.7 [任务标签（Tags）](#77-任务标签tags)  ⭐ v4
    - 7.8 [Batch catch/finally 回调](#78-batch-catchfinally-回调)  ⭐ v4
    - 7.9 [队列暂停与恢复（Pause/Resume）](#79-队列暂停与恢复pauseresume)  ⭐ v4
-   - 7.10 [定时任务（Cron）](#710-定时任务cron)  ⭐ v4
+   - 7.10 [定时任务（Cron）](#710-定时任务cron--v4)
+     - [调度方式：every vs expr](#调度方式every-vs-expr)
+     - [高级选项](#高级选项)
+     - [立即触发 API](#立即触发-api)
+     - [触发历史 API](#触发历史-api)
 8. [Dashboard 说明](#8-dashboard-说明)
 
 ---
@@ -110,7 +114,7 @@ curl -X POST http://localhost:8080/api/jobs \
 |---|---|---|
 | `DASHBOARD_USER` | `admin` | Dashboard 登录用户名 |
 | `DASHBOARD_PASS` | `admin` | Dashboard 登录密码 |
-| `API_KEY` | _(空，不鉴权)_ | REST API 鉴权 Key；设置后所有 `/api/*` 请求须携带 `X-API-Key` header |
+| `API_KEY` | _(空，不鉴权)_ | REST API 鉴权 Key；**当前版本已禁用**，所有 `/api/*` 接口无需鉴权，直接访问 |
 | `DB_PATH` | `queue.db` | SQLite 数据库文件路径 |
 | `WS_JOB_TIMEOUT_SEC` | `300` | WS Worker 处理单个任务的最长等待时间（秒）。调用 AI API 等长耗时任务可设置更大的值，例如 `3600`（1 小时）。per-job 的 `timeout_sec` 字段优先级更高 |
 | `STALE_JOB_TIMEOUT_SEC` | `300` | Stale Job Reaper 判定任务卡死的阈值（秒）。建议 ≥ `WS_JOB_TIMEOUT_SEC`，否则任务还没超时就被 Reaper 放回 pending |
@@ -131,11 +135,7 @@ WS_JOB_TIMEOUT_SEC=3600 STALE_JOB_TIMEOUT_SEC=3600 ./goapp
 ### 3.2 REST API 参考
 
 所有 `/api/*` 接口均支持 CORS（`Access-Control-Allow-Origin: *`）。  
-若设置了 `API_KEY` 环境变量，每个请求须携带：
-
-```
-X-API-Key: <your-api-key>
-```
+当前版本**无需鉴权**，可直接调用所有接口（`API_KEY` 环境变量已禁用）。
 
 ---
 
@@ -383,10 +383,21 @@ X-API-Key: <your-api-key>
     "id": 1,
     "name": "hourly-report",
     "every": "1h",
+    "expr": "",
+    "timezone": "",
     "queue": "default",
     "job_type": "generate_report",
-    "data": {},
-    "next_run_at": 1713344400
+    "data": "{}",
+    "tags": ["report"],
+    "without_overlapping": false,
+    "one_time": false,
+    "max_runs": 0,
+    "run_count": 5,
+    "expires_at": 0,
+    "enabled": true,
+    "last_run_at": 1713344340,
+    "next_run_at": 1713344400,
+    "created_at": 1713340800
   }
 ]
 ```
@@ -409,11 +420,39 @@ X-API-Key: <your-api-key>
 
 `every` 支持的单位：`s`（秒）、`m`（分钟）、`h`（小时）、`d`（天）、`w`（周）。
 
+也可使用标准 5 字段 **cron 表达式**（`expr` 字段），`every` 与 `expr` 二选一：
+
+```json
+{
+  "name":     "daily-8am",
+  "expr":     "0 8 * * *",
+  "timezone": "Asia/Shanghai",
+  "queue":    "default",
+  "job_type": "daily_task",
+  "data":     {}
+}
+```
+
 ---
 
-#### PUT /api/crons/{id} — 更新定时任务  ⭐ v4
+#### PATCH /api/crons/{id} — 局部更新定时任务  ⭐ v4
 
-请求体同 POST /api/crons。
+支持局部修改，只传需要变更的字段：
+
+```json
+{ "enabled": false }
+{ "every": "30m" }
+{ "expr": "0 9 * * 1", "timezone": "Asia/Shanghai" }
+{ "without_overlapping": true }
+{ "max_runs": 10 }
+{ "tags": ["report", "daily"] }
+```
+
+---
+
+#### PUT /api/crons/{id} — 全量更新定时任务  ⭐ v4
+
+请求体同 POST /api/crons（全量替换）。
 
 ---
 
@@ -424,6 +463,50 @@ X-API-Key: <your-api-key>
 ```json
 { "message": "cron deleted" }
 ```
+
+---
+
+#### POST /api/crons/{id}/trigger — 立即触发一次  ⭐ v4
+
+手动向队列投递一次任务，**不影响** `next_run_at` 定时计划。
+
+**响应（200）：**
+
+```json
+{ "message": "triggered", "job_id": 42, "cron_id": 1 }
+```
+
+---
+
+#### GET /api/crons/{id}/logs — 查询触发历史  ⭐ v4
+
+查询参数：`?limit=50`（默认 50 条）
+
+**响应（200）：**
+
+```json
+[
+  {
+    "id": 10,
+    "cron_id": 1,
+    "job_id": 42,
+    "fired_at": 1713344400,
+    "skipped": false,
+    "skip_reason": "",
+    "created_at": 1713344400
+  },
+  {
+    "id": 9,
+    "cron_id": 1,
+    "job_id": 0,
+    "fired_at": 1713344340,
+    "skipped": true,
+    "skip_reason": "overlapping"
+  }
+]
+```
+
+`skip_reason` 可能的值：`overlapping`（防重叠跳过）、`expired`（已过期）、`max_runs_reached`（达到最大触发次数）、`manual_trigger`（手动触发）。
 
 ---
 
@@ -1294,8 +1377,10 @@ Cron 的本质是**定时生成队列任务**，整个流程分三层：
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Cron 调度器                               │
 │  每 10s 扫描一次 cron_jobs 表，找出 next_run_at ≤ 当前时间的记录  │
-│  → 向指定队列投递一个普通 Job（job_type / data 由 cron 定义）     │
-│  → 更新 last_run_at 和 next_run_at（当前时间 + every 间隔）      │
+│  → 向指定队列投递一个普通 Job（job_type / data / tags 由 cron 定义）│
+│  → 更新 last_run_at 和 next_run_at                               │
+│    · every 模式：当前时间 + 间隔                                  │
+│    · expr 模式：cron 表达式计算下一个整点（支持 timezone）          │
 └───────────────────────────┬─────────────────────────────────────┘
                             │ 投递到队列（与手动 POST /api/jobs 完全等价）
                             ▼
@@ -1372,17 +1457,192 @@ curl -X DELETE http://localhost:8080/api/crons/1
 
 ---
 
+#### 调度方式：every vs expr
+
+两种调度方式**二选一**，不可同时使用：
+
+| 方式 | 字段 | 示例 | 适用场景 |
+|---|---|---|---|
+| 固定间隔 | `every` | `30s` / `5m` / `1h` / `1d` / `1w` | 每隔固定时间触发，从创建时刻起算 |
+| Cron 表达式 | `expr` | `0 8 * * *` / `*/5 * * * *` | 按日历时间触发（整点、每天某时、每周某天等） |
+
+**every 示例：**
+
+```bash
+# 每 30 秒触发一次
+curl -X POST http://localhost:8080/api/crons   -H "Content-Type: application/json"   -d '{"name":"heartbeat","every":"30s","queue":"default","job_type":"ping","data":{}}'
+```
+
+**expr 示例（配合 timezone）：**
+
+```bash
+# 每天上午 8:00（上海时间）触发
+curl -X POST http://localhost:8080/api/crons   -H "Content-Type: application/json"   -d '{
+    "name":     "daily-report",
+    "expr":     "0 8 * * *",
+    "timezone": "Asia/Shanghai",
+    "queue":    "default",
+    "job_type": "generate_report",
+    "data":     {}
+  }'
+
+# 每周一上午 9:00（上海时间）触发
+curl -X POST http://localhost:8080/api/crons   -H "Content-Type: application/json"   -d '{
+    "name":     "weekly-summary",
+    "expr":     "0 9 * * 1",
+    "timezone": "Asia/Shanghai",
+    "queue":    "default",
+    "job_type": "weekly_report",
+    "data":     {}
+  }'
+```
+
+常用 cron 表达式速查：
+
+| 表达式 | 含义 |
+|---|---|
+| `* * * * *` | 每分钟 |
+| `*/5 * * * *` | 每 5 分钟 |
+| `0 * * * *` | 每小时整点 |
+| `0 8 * * *` | 每天 08:00 |
+| `0 0 * * *` | 每天 00:00（午夜） |
+| `0 9 * * 1` | 每周一 09:00 |
+| `0 0 1 * *` | 每月 1 日 00:00 |
+
+---
+
+#### 高级选项
+
+##### without_overlapping — 防重叠
+
+开启后，若上次触发的 Job 仍在 **running** 状态，本次触发将被跳过，并推进 `next_run_at`。
+
+> **注意**：只检查 `running` 状态，不检查 `pending`。即使队列中有积压的 pending job，也不会阻止下次触发。
+
+```bash
+curl -X POST http://localhost:8080/api/crons   -H "Content-Type: application/json"   -d '{
+    "name":                "long-task",
+    "every":               "1m",
+    "queue":               "default",
+    "job_type":            "heavy_compute",
+    "data":                {},
+    "without_overlapping": true
+  }'
+```
+
+##### one_time — 一次性触发
+
+触发一次后自动 disabled，适合延迟执行的一次性任务：
+
+```bash
+curl -X POST http://localhost:8080/api/crons   -H "Content-Type: application/json"   -d '{
+    "name":     "send-welcome-email",
+    "every":    "10s",
+    "queue":    "default",
+    "job_type": "send_email",
+    "data":     {"to": "user@example.com"},
+    "one_time": true
+  }'
+```
+
+##### max_runs — 最大触发次数
+
+达到指定次数后自动 disabled：
+
+```bash
+# 只触发 3 次
+curl -X POST http://localhost:8080/api/crons   -H "Content-Type: application/json"   -d '{
+    "name":     "limited-task",
+    "every":    "1h",
+    "queue":    "default",
+    "job_type": "limited_job",
+    "data":     {},
+    "max_runs": 3
+  }'
+```
+
+##### expires_at — 过期时间
+
+到达指定时间戳后自动 disabled：
+
+```bash
+# 设置 24 小时后过期（Python 计算时间戳）
+import time
+expires = int(time.time()) + 86400
+
+curl -X POST http://localhost:8080/api/crons   -H "Content-Type: application/json"   -d "{
+    "name":       "temp-task",
+    "every":      "5m",
+    "queue":      "default",
+    "job_type":   "temp_job",
+    "data":       {},
+    "expires_at": $expires
+  }"
+```
+
+---
+
+#### 立即触发 API
+
+`POST /api/crons/{id}/trigger` — 手动向队列投递一次任务，**不影响** `next_run_at` 定时计划，也不计入 `run_count`：
+
+```bash
+curl -X POST http://localhost:8080/api/crons/1/trigger
+# → {"message":"triggered","job_id":42,"cron_id":1}
+```
+
+适用场景：
+- 测试 cron 配置是否正确
+- 手动补跑某次错过的任务
+- 在 cron-dashboard 中点击「立即触发」按钮
+
+---
+
+#### 触发历史 API
+
+`GET /api/crons/{id}/logs?limit=50` — 查询最近 N 次触发记录（默认 50 条，倒序）：
+
+```bash
+curl http://localhost:8080/api/crons/1/logs?limit=10
+```
+
+**响应示例：**
+
+```json
+[
+  { "id": 10, "cron_id": 1, "job_id": 42, "fired_at": 1713344400, "skipped": false, "skip_reason": "" },
+  { "id":  9, "cron_id": 1, "job_id":  0, "fired_at": 1713344340, "skipped": true,  "skip_reason": "overlapping" }
+]
+```
+
+| `skip_reason` 值 | 含义 |
+|---|---|
+| _(空)_ | 正常触发 |
+| `overlapping` | 防重叠跳过（上次 Job 仍在 running） |
+| `expired` | cron 已过期（`expires_at` 到期） |
+| `max_runs_reached` | 达到最大触发次数 |
+| `dispatch_error: ...` | 投递 Job 时发生错误 |
+
+---
+
 #### 请求字段说明
 
 | 字段 | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `name` | string | 否 | — | 便于识别的名称，不影响执行 |
-| `every` | string | **是** | — | 执行间隔，如 `30s` / `5m` / `1h` / `1d` |
+| `every` | string | 二选一 | — | 执行间隔，如 `30s` / `5m` / `1h` / `1d` / `1w` |
+| `expr` | string | 二选一 | — | 标准 5 字段 cron 表达式，如 `0 8 * * *`（`every` 与 `expr` 二选一） |
+| `timezone` | string | 否 | UTC | 配合 `expr` 使用的时区，如 `Asia/Shanghai`、`America/New_York` |
 | `queue` | string | **是** | — | 任务投递到哪个队列 |
 | `job_type` | string | **是** | — | Worker 侧用于路由的任务类型标识 |
 | `data` | object | 否 | `{}` | 每次触发时传给 Worker 的 JSON 数据 |
+| `tags` | []string | 否 | — | 投递任务时附加的标签，透传给 Job |
 | `priority` | int | 否 | `5` | 投递任务的优先级（1-10，越大越优先） |
 | `max_attempts` | int | 否 | `3` | 任务失败后最多重试次数 |
+| `without_overlapping` | bool | 否 | `false` | 防重叠：上次触发的 Job 仍在 **running** 时跳过本次触发（注意：只检查 running，不检查 pending） |
+| `one_time` | bool | 否 | `false` | 触发一次后自动 disabled（类似 runOnce） |
+| `max_runs` | int | 否 | `0` | 最大触发次数，达到后自动 disabled（0 = 不限） |
+| `expires_at` | int64 | 否 | `0` | 过期时间（Unix 时间戳），到期后自动 disabled（0 = 永不过期） |
 
 ---
 
@@ -1390,18 +1650,26 @@ curl -X DELETE http://localhost:8080/api/crons/1
 
 ```json
 {
-  "id":           1,
-  "name":         "hourly-report",
-  "every":        "1h",
-  "queue":        "default",
-  "job_type":     "generate_report",
-  "data":         {"name": "hourly"},
-  "priority":     5,
-  "max_attempts": 3,
-  "enabled":      true,
-  "created_at":   1713340800,
-  "last_run_at":  1713344400,
-  "next_run_at":  1713348000
+  "id":                  1,
+  "name":                "hourly-report",
+  "every":               "1h",
+  "expr":                "",
+  "timezone":            "",
+  "queue":               "default",
+  "job_type":            "generate_report",
+  "data":                "{"name":"hourly"}",
+  "tags":                [],
+  "priority":            5,
+  "max_attempts":        3,
+  "without_overlapping": false,
+  "one_time":            false,
+  "max_runs":            0,
+  "run_count":           5,
+  "expires_at":          0,
+  "enabled":             true,
+  "created_at":          1713340800,
+  "last_run_at":         1713344400,
+  "next_run_at":         1713348000
 }
 ```
 
@@ -1410,6 +1678,11 @@ curl -X DELETE http://localhost:8080/api/crons/1
 | `enabled` | `true` = 正常触发；`false` = 已暂停，不再投递任务 |
 | `last_run_at` | 上次触发的 Unix 时间戳（0 表示从未触发） |
 | `next_run_at` | 下次预计触发的 Unix 时间戳 |
+| `run_count` | 已触发次数（含跳过的不计入） |
+| `without_overlapping` | 是否开启防重叠（只检查 running 状态） |
+| `one_time` | 是否为一次性触发 |
+| `max_runs` | 最大触发次数（0 = 不限） |
+| `expires_at` | 过期时间戳（0 = 永不过期） |
 
 ---
 
@@ -1471,4 +1744,4 @@ Dashboard 提供以下功能：
 
 ---
 
-*文档更新时间：2026-04-18*
+*文档更新时间：2026-04-18（P3-B Cron 增强版：expr/timezone/without_overlapping/one_time/max_runs/expires_at/trigger/logs）*
