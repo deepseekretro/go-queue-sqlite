@@ -1,25 +1,12 @@
 # go-queue-sqlite 使用文档
 
-
-## 示例仓库
-
-本项目在 GitHub 仓库的 `examples/` 目录下提供以下官方示例：
-
-| 示例 | 语言 / 环境 | 链接 |
-|---|---|---|
-| GoWorker | Go | [examples/goworker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/goworker) |
-| JS Worker | Node.js | [examples/js-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/js-worker) |
-| Python Worker | Python | [examples/python-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/python-worker) |
-| Tampermonkey 油猴脚本 | 浏览器 | [examples/tampermonkey](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/tampermonkey) |
-
----
-
 > 版本 4.0.0 · 基于 WebSocket 的轻量级任务队列系统
 
 ---
 
 ## 目录
 
+0. [示例仓库](#示例仓库)
 1. [快速开始](#1-快速开始)
 2. [架构概览](#2-架构概览)
 3. [服务端（goapp）](#3-服务端goapp)
@@ -42,6 +29,19 @@
    - 7.9 [队列暂停与恢复（Pause/Resume）](#79-队列暂停与恢复pauseresume)  ⭐ v4
    - 7.10 [定时任务（Cron）](#710-定时任务cron)  ⭐ v4
 8. [Dashboard 说明](#8-dashboard-说明)
+
+---
+
+## 示例仓库
+
+本项目在 GitHub 仓库的 `examples/` 目录下提供以下官方示例：
+
+| 示例 | 语言 / 环境 | 链接 |
+|---|---|---|
+| GoWorker | Go | [examples/goworker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/goworker) |
+| JS Worker | Node.js | [examples/js-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/js-worker) |
+| Python Worker | Python | [examples/python-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/python-worker) |
+| Tampermonkey 油猴脚本 | 浏览器 | [examples/tampermonkey](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/tampermonkey) |
 
 ---
 
@@ -528,6 +528,15 @@ Worker 通过 WebSocket 连接到服务端，URL 格式：
 ```
 ws://host:8080/ws/worker?queue=<队列名>
 ```
+
+> **队列是隐式创建的，无需预先注册。**
+>
+> 系统中没有独立的"队列注册表"，队列名是动态的：
+> - Worker 连接时携带 `queue` 参数，该队列即在 Hub 中"存在"
+> - 投递任务时携带 `queue` 字段，任务写入 DB，等 Worker 上线后自动消费
+> - 两者完全解耦，可以先投递任务再启动 Worker，也可以先启动 Worker 再投递任务
+>
+> `GET /api/queues` 返回的队列列表由两部分动态聚合：① 当前有 WS 连接的队列；② DB 中 `jobs` 表出现过的队列。
 
 **消息方向与类型：**
 
@@ -1322,4 +1331,4 @@ Dashboard 提供以下功能：
 
 ---
 
-*文档生成时间：2026-04-17*
+*文档更新时间：2026-04-18*
