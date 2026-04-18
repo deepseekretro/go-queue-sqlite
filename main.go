@@ -1938,6 +1938,8 @@ func main() {
 	}
 
 	mux.HandleFunc("/", requireLogin(handleIndex))
+	mux.HandleFunc("/dir", requireLogin(handleDir))
+	mux.HandleFunc("/dir/", requireLogin(handleDir))
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleLoginSubmit(w, r)
