@@ -12,21 +12,24 @@ import (
 
 // ─────────────────────────────────────────────────────────────────────────────
 // /dir — 目录浏览 & 文件下载
-// 路由：GET /dir        → 显示程序所在目录
-//       GET /dir/sub    → 浏览子目录
-//       GET /dir/file   → 下载文件
-// 安全：requireLogin 保护；路径穿越防护；不暴露 .git 等隐藏目录
+//
+// URL 设计：
+//   GET /dir              → 显示 goapp 所在目录（默认根）
+//   GET /dir?path=/       → 访问 Linux 根目录
+//   GET /dir?path=/etc    → 访问任意绝对路径
+//   GET /dir?path=..      → 相对于当前目录的上级（会被转为绝对路径）
+//   GET /dir?path=/foo/bar.txt → 下载文件
+//
+// 安全：requireLogin 保护；路径用 filepath.Clean 规范化；无路径白名单限制
 // ─────────────────────────────────────────────────────────────────────────────
 
-// dirRoot 返回程序所在目录（os.Executable 解析后的目录）
-func dirRoot() string {
+// dirDefaultRoot 返回 goapp 程序所在目录（默认起始目录）
+func dirDefaultRoot() string {
 	exe, err := os.Executable()
 	if err != nil {
-		// 降级：使用当前工作目录
 		wd, _ := os.Getwd()
 		return wd
 	}
-	// EvalSymlinks 解析软链接，得到真实路径
 	real, err := filepath.EvalSymlinks(exe)
 	if err != nil {
 		return filepath.Dir(exe)
@@ -34,39 +37,38 @@ func dirRoot() string {
 	return filepath.Dir(real)
 }
 
-// handleDir 处理 /dir 及其子路径的请求
+// handleDir 处理 /dir 请求
 func handleDir(w http.ResponseWriter, r *http.Request) {
-	root := dirRoot()
-
-	// 从 URL 提取相对路径：/dir/foo/bar → foo/bar
-	relPath := strings.TrimPrefix(r.URL.Path, "/dir")
-	relPath = strings.TrimPrefix(relPath, "/")
-
-	// 安全清理：防止路径穿越（../）
-	clean := filepath.Clean(filepath.Join(root, relPath))
-	if !strings.HasPrefix(clean, root) {
-		http.Error(w, "403 Forbidden", http.StatusForbidden)
-		return
+	// 解析目标路径
+	targetPath := r.URL.Query().Get("path")
+	if targetPath == "" {
+		// 默认：goapp 所在目录
+		targetPath = dirDefaultRoot()
+	} else if !filepath.IsAbs(targetPath) {
+		// 相对路径：相对于 goapp 根目录解析
+		targetPath = filepath.Join(dirDefaultRoot(), targetPath)
 	}
+	// 规范化（处理 .. / . / 多余斜杠）
+	targetPath = filepath.Clean(targetPath)
 
-	fi, err := os.Stat(clean)
+	fi, err := os.Stat(targetPath)
 	if err != nil {
-		http.NotFound(w, r)
+		http.Error(w, "404 Not Found: "+err.Error(), http.StatusNotFound)
 		return
 	}
 
 	if fi.IsDir() {
-		renderDirListing(w, r, root, clean, relPath)
+		renderDirListing(w, r, targetPath)
 	} else {
 		// 文件：触发下载
 		w.Header().Set("Content-Disposition",
-			fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(clean)))
-		http.ServeFile(w, r, clean)
+			fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(targetPath)))
+		http.ServeFile(w, r, targetPath)
 	}
 }
 
 // renderDirListing 渲染目录列表 HTML 页面
-func renderDirListing(w http.ResponseWriter, r *http.Request, root, absPath, relPath string) {
+func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 	entries, err := os.ReadDir(absPath)
 	if err != nil {
 		http.Error(w, "500 Internal Server Error: "+err.Error(), http.StatusInternalServerError)
@@ -75,16 +77,6 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, root, absPath, rel
 
 	// 分离目录和文件，分别排序
 	var dirs, files []os.DirEntry
-	for _, e := range entries {
-		if dirs, files = append(dirs, nil), append(files, nil); e.IsDir() {
-			dirs[len(dirs)-1] = e
-		} else {
-			files[len(files)-1] = e
-		}
-	}
-	// 去掉 nil（上面写法有 bug，重写）
-	dirs = dirs[:0]
-	files = files[:0]
 	for _, e := range entries {
 		if e.IsDir() {
 			dirs = append(dirs, e)
@@ -95,36 +87,29 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, root, absPath, rel
 	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
 	sort.Slice(files, func(i, j int) bool { return files[i].Name() < files[j].Name() })
 
-	// 构建面包屑导航
-	breadcrumb := buildBreadcrumb(relPath)
+	// 构建面包屑导航（基于绝对路径，每段可点击）
+	breadcrumb := buildAbsBreadcrumb(absPath)
 
-	// 构建行 HTML
+	// 构建表格行 HTML
 	var rows strings.Builder
 
-	// 返回上级目录（非根目录时显示）
-	if relPath != "" && relPath != "." {
-		parent := filepath.ToSlash(filepath.Dir("/dir/" + relPath))
-		if parent == "/dir" {
-			parent = "/dir"
-		}
+	// 上级目录（.. 条目，始终显示，除非已在文件系统根 /）
+	parent := filepath.Dir(absPath)
+	if parent != absPath { // filepath.Dir("/") == "/"，相等时说明已在根
+		parentURL := "/dir?path=" + urlEncodePath(parent)
 		rows.WriteString(fmt.Sprintf(`
 		<tr class="dir-row">
 			<td class="icon-cell">📁</td>
 			<td><a href="%s" class="dir-link">..</a></td>
 			<td class="meta">—</td>
 			<td class="meta">—</td>
-		</tr>`, html.EscapeString(parent)))
+		</tr>`, html.EscapeString(parentURL)))
 	}
 
 	// 目录行
 	for _, e := range dirs {
 		name := e.Name()
-		href := "/dir/" + relPath
-		if relPath == "" || relPath == "." {
-			href = "/dir/" + name
-		} else {
-			href = "/dir/" + relPath + "/" + name
-		}
+		href := "/dir?path=" + urlEncodePath(filepath.Join(absPath, name))
 		info, _ := e.Info()
 		modTime := ""
 		if info != nil {
@@ -146,12 +131,7 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, root, absPath, rel
 	// 文件行
 	for _, e := range files {
 		name := e.Name()
-		href := "/dir/" + relPath
-		if relPath == "" || relPath == "." {
-			href = "/dir/" + name
-		} else {
-			href = "/dir/" + relPath + "/" + name
-		}
+		href := "/dir?path=" + urlEncodePath(filepath.Join(absPath, name))
 		info, _ := e.Info()
 		size := ""
 		modTime := ""
@@ -174,27 +154,29 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, root, absPath, rel
 		))
 	}
 
-	// 统计信息
 	summary := fmt.Sprintf("%d 个目录，%d 个文件", len(dirs), len(files))
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, dirHTML,
-		html.EscapeString(absPath), // %s — 页面标题路径
-		breadcrumb,                 // %s — 面包屑
-		html.EscapeString(absPath), // %s — 当前路径显示
-		summary,                    // %s — 统计
-		rows.String(),              // %s — 表格行
+		html.EscapeString(absPath), // 页面标题
+		breadcrumb,                 // 面包屑 HTML
+		html.EscapeString(absPath), // 路径栏
+		summary,                    // 统计
+		rows.String(),              // 表格行
 	)
 }
 
-// buildBreadcrumb 根据 relPath 构建面包屑 HTML
-func buildBreadcrumb(relPath string) string {
+// buildAbsBreadcrumb 根据绝对路径构建可点击面包屑
+// 例：/home/user/goapp → 🏠 / ›  home ›  user ›  goapp（每段可点击）
+func buildAbsBreadcrumb(absPath string) string {
 	var b strings.Builder
-	b.WriteString(`<a href="/dir" class="crumb">🏠 根目录</a>`)
-	if relPath == "" || relPath == "." {
-		return b.String()
-	}
-	parts := strings.Split(relPath, "/")
+
+	// Linux 根目录 /
+	rootURL := "/dir?path=/"
+	b.WriteString(fmt.Sprintf(`<a href="%s" class="crumb">🖥️ /</a>`, html.EscapeString(rootURL)))
+
+	// 拆分路径各段（去掉开头的空字符串）
+	parts := strings.Split(strings.TrimPrefix(absPath, "/"), "/")
 	cumPath := ""
 	for i, part := range parts {
 		if part == "" {
@@ -203,11 +185,28 @@ func buildBreadcrumb(relPath string) string {
 		cumPath += "/" + part
 		b.WriteString(` <span class="crumb-sep">›</span> `)
 		if i == len(parts)-1 {
-			// 最后一段：不加链接
+			// 最后一段：当前目录，不加链接（加粗高亮）
 			b.WriteString(fmt.Sprintf(`<span class="crumb-cur">%s</span>`, html.EscapeString(part)))
 		} else {
-			b.WriteString(fmt.Sprintf(`<a href="/dir%s" class="crumb">%s</a>`,
-				html.EscapeString(cumPath), html.EscapeString(part)))
+			href := "/dir?path=" + urlEncodePath(cumPath)
+			b.WriteString(fmt.Sprintf(`<a href="%s" class="crumb">%s</a>`,
+				html.EscapeString(href), html.EscapeString(part)))
+		}
+	}
+	return b.String()
+}
+
+// urlEncodePath 对路径做 URL 编码（保留 /，对其他特殊字符编码）
+func urlEncodePath(p string) string {
+	// 手动编码：只编码空格和特殊字符，保留路径分隔符 /
+	var b strings.Builder
+	for _, c := range p {
+		switch {
+		case c == '/' || c == '-' || c == '_' || c == '.' ||
+			(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'):
+			b.WriteRune(c)
+		default:
+			b.WriteString(fmt.Sprintf("%%%02X", c))
 		}
 	}
 	return b.String()
@@ -265,8 +264,6 @@ func fileIcon(name string) string {
 // HTML 模板
 // ─────────────────────────────────────────────────────────────────────────────
 
-// dirHTML 是目录浏览页面的 HTML 模板
-// 参数顺序：页面标题路径, 面包屑HTML, 当前路径, 统计信息, 表格行HTML
 const dirHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -277,7 +274,6 @@ const dirHTML = `<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
 
-  /* ── Header ── */
   header {
     background: linear-gradient(135deg, #1e3a5f, #0f172a);
     padding: 16px 32px;
@@ -285,6 +281,13 @@ const dirHTML = `<!DOCTYPE html>
     display: flex; align-items: center; gap: 16px;
   }
   header h1 { font-size: 1.3rem; color: #60a5fa; }
+  header .home-btn {
+    background: #1e293b; color: #60a5fa;
+    border: 1px solid #334155; border-radius: 8px;
+    padding: 6px 14px; font-size: 0.82rem; text-decoration: none;
+    transition: background 0.15s;
+  }
+  header .home-btn:hover { background: #1e3a5f; }
   header .back-btn {
     margin-left: auto;
     background: #1e3a5f; color: #93c5fd;
@@ -294,19 +297,18 @@ const dirHTML = `<!DOCTYPE html>
   }
   header .back-btn:hover { background: #2563eb; color: #fff; }
 
-  /* ── Breadcrumb ── */
   .breadcrumb {
     padding: 12px 32px;
     background: #0f172a;
     border-bottom: 1px solid #1e293b;
     font-size: 0.85rem;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 2px;
   }
-  .crumb { color: #60a5fa; text-decoration: none; }
-  .crumb:hover { text-decoration: underline; }
-  .crumb-sep { color: #475569; margin: 0 4px; }
-  .crumb-cur { color: #e2e8f0; font-weight: 600; }
+  .crumb { color: #60a5fa; text-decoration: none; padding: 2px 4px; border-radius: 4px; }
+  .crumb:hover { background: #1e293b; text-decoration: underline; }
+  .crumb-sep { color: #475569; margin: 0 2px; }
+  .crumb-cur { color: #e2e8f0; font-weight: 600; padding: 2px 4px; }
 
-  /* ── Main ── */
   main { padding: 24px 32px; }
 
   .path-bar {
@@ -318,7 +320,6 @@ const dirHTML = `<!DOCTYPE html>
   .path-bar .path-text { color: #60a5fa; font-family: monospace; word-break: break-all; }
   .path-bar .summary { margin-left: auto; color: #64748b; white-space: nowrap; }
 
-  /* ── Table ── */
   .dir-table {
     width: 100%%;
     border-collapse: collapse;
@@ -348,23 +349,17 @@ const dirHTML = `<!DOCTYPE html>
 
   .icon-cell { width: 36px; text-align: center; font-size: 1.1rem; }
 
-  .dir-link {
-    color: #93c5fd; text-decoration: none; font-weight: 500;
-  }
+  .dir-link { color: #93c5fd; text-decoration: none; font-weight: 500; }
   .dir-link:hover { text-decoration: underline; color: #60a5fa; }
 
-  .file-link {
-    color: #e2e8f0; text-decoration: none;
-  }
+  .file-link { color: #e2e8f0; text-decoration: none; }
   .file-link:hover { color: #60a5fa; text-decoration: underline; }
 
   .meta { color: #64748b; font-size: 0.78rem; }
   .size { font-family: monospace; color: #94a3b8; }
 
-  /* ── Empty state ── */
   .empty { text-align: center; padding: 48px; color: #475569; font-size: 0.9rem; }
 
-  /* ── Responsive ── */
   @media (max-width: 640px) {
     main { padding: 16px; }
     header { padding: 12px 16px; }
@@ -379,6 +374,7 @@ const dirHTML = `<!DOCTYPE html>
 <header>
   <span style="font-size:1.6rem">📁</span>
   <h1>目录浏览</h1>
+  <a href="/dir" class="home-btn">🏠 goapp 根目录</a>
   <a href="/" class="back-btn">← 返回 Dashboard</a>
 </header>
 
@@ -409,4 +405,3 @@ const dirHTML = `<!DOCTYPE html>
 </body>
 </html>
 `
-
