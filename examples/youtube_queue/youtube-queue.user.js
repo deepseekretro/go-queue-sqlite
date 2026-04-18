@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        YouTube 投递到 GoQueue 队列
 // @namespace   https://github.com/deepseekretro/go-queue-sqlite
-// @version     1.0.0
+// @version     1.1.0
 // @description 在 YouTube 首页/频道/搜索页/播放页添加「加入队列」按钮，点击后将视频信息投递到 GoQueue 任务队列
 // @author      GoQueue
 // @match       https://www.youtube.com/
@@ -237,25 +237,93 @@
     });
   }
 
-  // ─── 🔎 标题获取器 ────────────────────────────────────────────────────────
+  // ─── 🔎 标题获取器（覆盖所有已知 YouTube DOM 变体）────────────────────────
   function getSafeTitle(context = null, isWatchPage = false) {
     let title = '';
+
     if (isWatchPage) {
-      const h1 = document.querySelector('ytd-watch-metadata h1') || document.querySelector('#title h1');
-      if (h1) title = h1.textContent;
-      if (!title) title = document.title.replace(' - YouTube', '');
-    } else if (context) {
-      const newUiHeading = context.querySelector('.yt-lockup-metadata-view-model__heading-reset');
-      if (newUiHeading && newUiHeading.title) return newUiHeading.title;
-      const newUiLink = context.querySelector('.yt-lockup-metadata-view-model__title');
-      if (newUiLink) return newUiLink.textContent.trim();
-      const oldTitleEl = context.querySelector('#video-title');
-      if (oldTitleEl) title = oldTitleEl.textContent.trim() || oldTitleEl.title || oldTitleEl.getAttribute('aria-label');
+      // 播放页：按优先级逐一尝试
+      const watchSelectors = [
+        'ytd-watch-metadata h1 yt-formatted-string',  // 2024+ 新版
+        'ytd-watch-metadata h1',
+        '#above-the-fold #title h1 yt-formatted-string',
+        '#above-the-fold #title h1',
+        '#title h1 yt-formatted-string',
+        '#title h1',
+        'h1.ytd-watch-metadata',
+      ];
+      for (const sel of watchSelectors) {
+        const el = document.querySelector(sel);
+        if (el) {
+          title = el.textContent.trim();
+          if (title) break;
+        }
+      }
+      // 兜底：document.title（格式为 "视频标题 - YouTube"）
       if (!title) {
-        const link = context.querySelector('a#video-title-link') || context.querySelector('a#thumbnail');
-        if (link) title = link.title || link.getAttribute('aria-label');
+        title = document.title.replace(/\s*[-–—]\s*YouTube\s*$/i, '').trim();
+      }
+
+    } else if (context) {
+      // 列表页卡片：按优先级逐一尝试
+
+      // 1. 新版 lockup UI（2023+）
+      const heading = context.querySelector('.yt-lockup-metadata-view-model__heading-reset');
+      if (heading) {
+        title = heading.title || heading.textContent.trim();
+        if (title) return title;
+      }
+
+      const lockupTitle = context.querySelector('.yt-lockup-metadata-view-model__title');
+      if (lockupTitle) {
+        title = lockupTitle.title || lockupTitle.textContent.trim();
+        if (title) return title;
+      }
+
+      // 2. lockup wiz（2024+）
+      const wizLink = context.querySelector('yt-lockup-view-model-wiz__metadata a, .yt-lockup-view-model-wiz__metadata a');
+      if (wizLink) {
+        title = wizLink.title || wizLink.getAttribute('aria-label') || wizLink.textContent.trim();
+        if (title) return title;
+      }
+
+      // 3. 旧版 #video-title（yt-formatted-string 或普通元素）
+      const videoTitleSelectors = [
+        'yt-formatted-string#video-title',
+        'span#video-title',
+        'a#video-title',
+        '#video-title',
+      ];
+      for (const sel of videoTitleSelectors) {
+        const el = context.querySelector(sel);
+        if (el) {
+          title = el.textContent.trim() || el.title || el.getAttribute('aria-label') || '';
+          if (title) return title;
+        }
+      }
+
+      // 4. a#video-title-link
+      const titleLink = context.querySelector('a#video-title-link');
+      if (titleLink) {
+        title = titleLink.title || titleLink.getAttribute('aria-label') || titleLink.textContent.trim();
+        if (title) return title;
+      }
+
+      // 5. 通用兜底：找卡片内 href 含 watch 的 <a> 且有 title/aria-label
+      const watchLinks = context.querySelectorAll('a[href*="watch"]');
+      for (const a of watchLinks) {
+        title = a.title || a.getAttribute('aria-label') || '';
+        if (title) return title;
+      }
+
+      // 6. 最后兜底：a#thumbnail 的 aria-label
+      const thumb = context.querySelector('a#thumbnail');
+      if (thumb) {
+        title = thumb.getAttribute('aria-label') || thumb.title || '';
+        if (title) return title;
       }
     }
+
     return title ? title.trim() : '未找到标题';
   }
 
@@ -292,15 +360,30 @@
 
   // ─── 🖥️ 页面插入逻辑 ──────────────────────────────────────────────────────
   function insertButtonToCard(card) {
-    const aTag = card.querySelector('a.yt-lockup-view-model__content-image')
-               || card.querySelector('a#thumbnail')
-               || card.querySelector('a');
-    const videoUrl = aTag?.href;
-    if (!videoUrl || !videoUrl.includes('watch')) return;
+    // 按优先级查找视频链接（覆盖新旧版 YouTube DOM）
+    const urlSelectors = [
+      'a.yt-lockup-view-model__content-image',  // 新版 lockup
+      'a.yt-lockup-view-model-wiz__content-image',
+      'a#thumbnail',                             // 旧版
+      'a[href*="watch"]',                        // 通用兜底
+    ];
+    let videoUrl = '';
+    for (const sel of urlSelectors) {
+      const a = card.querySelector(sel);
+      if (a && a.href && a.href.includes('watch')) {
+        videoUrl = a.href;
+        break;
+      }
+    }
+    if (!videoUrl) return;
     if (card.querySelector('.goqueue-btn')) return;
 
+    // 按优先级查找文字容器（按钮插入位置）
     const textContainer = card.querySelector('.yt-lockup-metadata-view-model__text-container')
-                        || card.querySelector('#meta');
+                        || card.querySelector('.yt-lockup-view-model-wiz__metadata')
+                        || card.querySelector('#meta')
+                        || card.querySelector('#details')
+                        || card.querySelector('.details');
 
     if (textContainer) {
       textContainer.appendChild(createButton(videoUrl, card));
