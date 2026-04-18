@@ -87,6 +87,16 @@ func handleDir(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 文件处理
+	ext := strings.ToLower(filepath.Ext(targetPath))
+	isHTML := ext == ".html" || ext == ".htm"
+
+	if isHTML {
+		// HTML 文件：直接以 text/html 返回，让浏览器正常渲染
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		http.ServeFile(w, r, targetPath)
+		return
+	}
+
 	raw := r.URL.Query().Get("raw") == "1"
 	if raw {
 		// raw=1：返回纯文本内容（供前端 fetch 读取后弹窗展示）
@@ -173,9 +183,18 @@ func renderDirListing(w http.ResponseWriter, r *http.Request, absPath string) {
 		isText := isTextFile(name)
 		rawURL := "/dir?path=" + urlEncodePath(filePath) + "&raw=1"
 		dlURL := "/dir?path=" + urlEncodePath(filePath)
+		nameExt := strings.ToLower(filepath.Ext(name))
+		isHTMLFile := nameExt == ".html" || nameExt == ".htm"
 
 		var linkHTML string
-		if isText {
+		if isHTMLFile {
+			// HTML 文件：新标签页直接打开（浏览器正常渲染）
+			linkHTML = fmt.Sprintf(
+				`<a href="%s" class="file-link html-open" target="_blank" rel="noopener">%s</a>`,
+				html.EscapeString(dlURL),
+				html.EscapeString(name),
+			)
+		} else if isText {
 			// 文本文件：点击触发 JS 弹窗预览
 			linkHTML = fmt.Sprintf(
 				`<a href="#" class="file-link text-preview" data-raw="%s" data-name="%s">%s</a>`,
@@ -398,6 +417,8 @@ const dirHTML = `<!DOCTYPE html>
   .file-link:hover { color: #60a5fa; text-decoration: underline; }
   .file-link.text-preview { color: #a5f3fc; cursor: pointer; }
   .file-link.text-preview:hover { color: #22d3ee; text-decoration: underline; }
+  .file-link.html-open { color: #fb923c; }
+  .file-link.html-open:hover { color: #f97316; text-decoration: underline; }
 
   /* 下载按钮 */
   .dl-btn {
