@@ -422,9 +422,8 @@ const dirHTML = `<!DOCTYPE html>
     box-shadow: 0 25px 60px rgba(0,0,0,0.6);
     display: flex;
     flex-direction: column;
-    /* 拖拽定位 */
-    position: fixed;
-    margin: 0;
+    /* 拖拽用 transform，不改变 position，保持浏览器默认居中 */
+    transform: translate(0px, 0px);
   }
   dialog::backdrop { background: rgba(0,0,0,0.65); backdrop-filter: blur(3px); }
   .dialog-header { cursor: grab; user-select: none; }
@@ -580,32 +579,27 @@ const dirHTML = `<!DOCTYPE html>
   dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && dialog.open) dialog.close(); });
 
-  // ── 拖拽移动弹窗 ──
-  // 拖拽 dialog-header 区域来移动整个 dialog
+  // ── 拖拽移动弹窗（用 transform: translate 实现，不影响 close()）──
   const dialogHeader = document.querySelector('.dialog-header');
-  let isDragging = false, dragOffsetX = 0, dragOffsetY = 0;
+  let isDragging = false;
+  let dragStartX = 0, dragStartY = 0;  // mousedown 时鼠标位置
+  let translateX = 0, translateY = 0;  // 当前累计偏移量
 
   dialogHeader.addEventListener('mousedown', function (e) {
-    // 不拦截按钮点击
+    // 不拦截按钮/链接点击
     if (e.target.closest('button, a')) return;
     isDragging = true;
-    const rect = dialog.getBoundingClientRect();
-    dragOffsetX = e.clientX - rect.left;
-    dragOffsetY = e.clientY - rect.top;
+    dragStartX = e.clientX - translateX;
+    dragStartY = e.clientY - translateY;
     dialogHeader.style.cursor = 'grabbing';
     e.preventDefault();
   });
 
   document.addEventListener('mousemove', function (e) {
     if (!isDragging) return;
-    let newLeft = e.clientX - dragOffsetX;
-    let newTop  = e.clientY - dragOffsetY;
-    // 限制在视口内
-    const rect = dialog.getBoundingClientRect();
-    newLeft = Math.max(0, Math.min(newLeft, window.innerWidth  - rect.width));
-    newTop  = Math.max(0, Math.min(newTop,  window.innerHeight - rect.height));
-    dialog.style.left = newLeft + 'px';
-    dialog.style.top  = newTop  + 'px';
+    translateX = e.clientX - dragStartX;
+    translateY = e.clientY - dragStartY;
+    dialog.style.transform = 'translate(' + translateX + 'px, ' + translateY + 'px)';
   });
 
   document.addEventListener('mouseup', function () {
@@ -631,14 +625,11 @@ const dirHTML = `<!DOCTYPE html>
     dialogDlBtn.download = fileName;
     dialogBody.innerHTML = '<div class="dialog-loading">⏳ 加载中…</div>';
     dialogFooter.textContent = '';
-    // 居中显示（position:fixed 后需手动居中）
-    dialog.style.left = '';
-    dialog.style.top  = '';
+    // 每次打开重置拖拽偏移，浏览器自动居中
+    translateX = 0;
+    translateY = 0;
+    dialog.style.transform = 'translate(0px, 0px)';
     dialog.showModal();
-    // 计算居中位置
-    const dr = dialog.getBoundingClientRect();
-    dialog.style.left = Math.max(0, (window.innerWidth  - dr.width)  / 2) + 'px';
-    dialog.style.top  = Math.max(0, (window.innerHeight - dr.height) / 2) + 'px';
 
     try {
       const resp = await fetch(rawURL);
