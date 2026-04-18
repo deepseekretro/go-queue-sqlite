@@ -426,8 +426,9 @@ const dirHTML = `<!DOCTYPE html>
     transform: translate(0px, 0px);
   }
   dialog::backdrop { background: rgba(0,0,0,0.65); backdrop-filter: blur(3px); }
-  .dialog-header { cursor: grab; user-select: none; }
-  .dialog-header:active { cursor: grabbing; }
+  /* 只有 dialog-title 区域是拖拽手柄，按钮不受影响 */
+  .dialog-title { cursor: grab; user-select: none; flex: 1; }
+  .dialog-title:active { cursor: grabbing; }
   .dialog-header {
     display: flex; align-items: center; gap: 12px;
     padding: 14px 20px;
@@ -449,8 +450,10 @@ const dirHTML = `<!DOCTYPE html>
   .dialog-dl-btn:hover { background: #2563eb; color: #fff; }
   .dialog-close {
     background: none; border: none; color: #64748b;
-    font-size: 1.3rem; cursor: pointer; padding: 2px 6px;
+    font-size: 1.3rem; cursor: pointer !important; padding: 2px 6px;
     border-radius: 6px; transition: all 0.15s; line-height: 1;
+    pointer-events: auto !important; position: relative; z-index: 10;
+    flex-shrink: 0;
   }
   .dialog-close:hover { background: #334155; color: #e2e8f0; }
   .dialog-body {
@@ -580,18 +583,17 @@ const dirHTML = `<!DOCTYPE html>
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && dialog.open) dialog.close(); });
 
   // ── 拖拽移动弹窗（用 transform: translate 实现，不影响 close()）──
-  const dialogHeader = document.querySelector('.dialog-header');
+  // 拖拽手柄只绑定在 dialogTitle 上，按钮区域完全不受影响
+  // dialogTitle 已在顶部声明，此处直接使用
   let isDragging = false;
-  let dragStartX = 0, dragStartY = 0;  // mousedown 时鼠标位置
-  let translateX = 0, translateY = 0;  // 当前累计偏移量
+  let dragStartX = 0, dragStartY = 0;
+  let translateX = 0, translateY = 0;
 
-  dialogHeader.addEventListener('mousedown', function (e) {
-    // 不拦截按钮/链接点击
-    if (e.target.closest('button, a')) return;
+  dialogTitle.addEventListener('mousedown', function (e) {
     isDragging = true;
     dragStartX = e.clientX - translateX;
     dragStartY = e.clientY - translateY;
-    dialogHeader.style.cursor = 'grabbing';
+    dialogTitle.style.cursor = 'grabbing';
     e.preventDefault();
   });
 
@@ -605,7 +607,7 @@ const dirHTML = `<!DOCTYPE html>
   document.addEventListener('mouseup', function () {
     if (isDragging) {
       isDragging = false;
-      dialogHeader.style.cursor = '';
+      dialogTitle.style.cursor = '';
     }
   });
 
