@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        YouTube 投递到 GoQueue 队列
 // @namespace   https://github.com/deepseekretro/go-queue-sqlite
-// @version     1.2.0
+// @version     1.3.0
 // @description 在 YouTube 首页/频道/搜索页/播放页添加「加入队列」按钮，点击后将视频信息投递到 GoQueue 任务队列
 // @author      GoQueue
 // @match       https://www.youtube.com/
@@ -157,10 +157,15 @@
   }
 
   // ─── 📋 日志打印 ──────────────────────────────────────────────────────────
-  function logVideoInfo(videoTitle, videoUrl) {
+  function logVideoInfo(videoTitle, videoUrl, meta) {
     console.group('📋 GoQueue 准备投递');
     console.log('📄 标题:', videoTitle);
     console.log('🔗 链接:', videoUrl);
+    if (meta) {
+      if (meta.channelName) console.log('📺 频道:', meta.channelName, meta.channelUrl);
+      if (meta.views)       console.log('👁 观看数:', meta.views);
+      if (meta.publishedAt) console.log('🕐 发布时间:', meta.publishedAt);
+    }
     console.log('📡 GoQueue API:', `${GOQUEUE_HOST}/api/jobs`);
     console.log('📦 队列:', QUEUE_NAME, '| job_type:', JOB_TYPE);
     console.groupEnd();
@@ -185,7 +190,7 @@
   //         # ... 业务逻辑 ...
   //         return f"已处理: {data['title']}"
   //
-  function enqueueVideo(videoTitle, videoUrl, button) {
+  function enqueueVideo(videoTitle, videoUrl, button, meta) {
     showToast('🚀 投递中...');
 
     const jobPayload = {
@@ -195,11 +200,15 @@
       max_attempts: MAX_ATTEMPTS,
       tags:         ['youtube'],
       data: {
-        title: videoTitle,
-        url:   videoUrl,
+        title:        videoTitle,
+        url:          videoUrl,
+        views:        (meta && meta.views)       || '',
+        published_at: (meta && meta.publishedAt) || '',
+        channel_name: (meta && meta.channelName) || '',
+        channel_url:  (meta && meta.channelUrl)  || '',
         // 额外元数据，方便 Worker 侧使用
-        queued_at:  new Date().toISOString(),
-        source_page: location.href
+        queued_at:    new Date().toISOString(),
+        source_page:  location.href
       }
     };
 
@@ -377,8 +386,9 @@
       const finalTitle = getSafeTitle(isWatch ? null : contextOrType, isWatch);
 
       if (finalUrl && finalUrl.includes('watch')) {
-        logVideoInfo(finalTitle, finalUrl);
-        enqueueVideo(finalTitle, finalUrl, button);
+        const cardMeta = isWatch ? {} : extractCardMeta(contextOrType);
+        logVideoInfo(finalTitle, finalUrl, cardMeta);
+        enqueueVideo(finalTitle, finalUrl, button, cardMeta);
       } else {
         showToast('❌ 无效链接', false);
       }
@@ -387,6 +397,63 @@
   }
 
   // ─── 🖥️ 页面插入逻辑 ──────────────────────────────────────────────────────
+  // ─── 📊 卡片元数据提取（views / 发布时间 / 频道名 / 频道链接）────────────
+  function extractCardMeta(card) {
+    const meta = { views: '', publishedAt: '', channelName: '', channelUrl: '' };
+
+    // 频道名 + 频道链接
+    // 真实 DOM: <a href="/@7techlife">Seven科技生活</a>
+    const channelSelectors = [
+      'a[href^="/@"]',                          // 2025+ 驼峰式（实测）
+      'a.ytd-channel-name',
+      'yt-formatted-string.ytd-channel-name a',
+      '#channel-name a',
+      '.ytd-video-meta-block a[href^="/@"]',
+    ];
+    for (const sel of channelSelectors) {
+      const a = card.querySelector(sel);
+      if (a && a.textContent.trim()) {
+        meta.channelName = a.textContent.trim();
+        // 转为绝对 URL
+        meta.channelUrl = a.href || ('https://www.youtube.com' + a.getAttribute('href'));
+        break;
+      }
+    }
+
+    // 观看数 + 发布时间
+    // 真实 DOM: 第二个 .ytContentMetadataViewModelMetadataRow 里
+    //   span[0] = "4.8K views"  span[2] = "6 hours ago"
+    const rows = card.querySelectorAll('.ytContentMetadataViewModelMetadataRow');
+    // 找包含 "views" 或 "watching" 的 row
+    for (const row of rows) {
+      const spans = row.querySelectorAll('.ytContentMetadataViewModelMetadataText');
+      for (let i = 0; i < spans.length; i++) {
+        const text = spans[i].textContent.trim();
+        if (/views?|watching/i.test(text)) {
+          meta.views = text;
+          // 发布时间通常在同一 row 的下一个 span
+          if (spans[i + 1]) meta.publishedAt = spans[i + 1].textContent.trim();
+          else if (spans[i - 1] && !/views?/i.test(spans[i - 1].textContent))
+            meta.publishedAt = spans[i - 1].textContent.trim();
+          break;
+        }
+      }
+      if (meta.views) break;
+    }
+
+    // 兜底：旧版 #metadata-line 等
+    if (!meta.views) {
+      const viewEl = card.querySelector('#metadata-line span:first-child, .ytd-video-meta-block span:first-child');
+      if (viewEl) meta.views = viewEl.textContent.trim();
+    }
+    if (!meta.publishedAt) {
+      const timeEl = card.querySelector('#metadata-line span:last-child, .ytd-video-meta-block span:last-child');
+      if (timeEl) meta.publishedAt = timeEl.textContent.trim();
+    }
+
+    return meta;
+  }
+
   function insertButtonToCard(card) {
     // 按优先级查找视频链接（覆盖新旧版 YouTube DOM）
     const urlSelectors = [
@@ -407,22 +474,11 @@
     if (!videoUrl) return;
     if (card.querySelector('.goqueue-btn')) return;
 
-    // 按优先级查找文字容器（按钮插入位置）
-    const textContainer = card.querySelector('.ytLockupMetadataViewModelTextContainer')  // 2025+ 驼峰式
-                        || card.querySelector('.yt-lockup-metadata-view-model__text-container')
-                        || card.querySelector('.yt-lockup-view-model-wiz__metadata')
-                        || card.querySelector('#meta')
-                        || card.querySelector('#details')
-                        || card.querySelector('.details');
-
-    if (textContainer) {
-      textContainer.appendChild(createButton(videoUrl, card));
-    } else {
-      const container = document.createElement('div');
-      container.style.marginTop = '4px';
-      container.appendChild(createButton(videoUrl, card));
-      card.appendChild(container);
-    }
+    // ⚠️ 按钮插入位置：直接 appendChild 到 card，避免插入 lockup 内部容器触发调试器
+    const container = document.createElement('div');
+    container.style.cssText = 'margin-top:4px;padding:0 4px;';
+    container.appendChild(createButton(videoUrl, card));
+    card.appendChild(container);
   }
 
   function insertButtons() {
