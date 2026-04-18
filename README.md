@@ -1286,21 +1286,82 @@ curl -X POST http://localhost:8080/api/queues/default/resume
 
 ### 7.10 定时任务（Cron）  ⭐ v4
 
-内置轻量级 Cron 调度器，按固定间隔自动投递任务，无需外部 crontab。
+#### 工作原理
+
+Cron 的本质是**定时生成队列任务**，整个流程分三层：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Cron 调度器                               │
+│  每 10s 扫描一次 cron_jobs 表，找出 next_run_at ≤ 当前时间的记录  │
+│  → 向指定队列投递一个普通 Job（job_type / data 由 cron 定义）     │
+│  → 更新 last_run_at 和 next_run_at（当前时间 + every 间隔）      │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ 投递到队列（与手动 POST /api/jobs 完全等价）
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         任务队列（SQLite）                        │
+│  pending → running → done / failed                              │
+│  支持优先级、重试、去重、限流等所有普通任务特性                      │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ WebSocket 派发
+                            ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Worker（Go / JS / Python）                    │
+│  收到 job_type + data，执行业务逻辑，返回 success/failed          │
+│  Worker 完全不感知"这个任务来自 Cron 还是手动投递"                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**一句话总结**：Cron 只负责"按时把任务放进队列"，真正的业务逻辑由 Worker 执行。Cron 任务和手动投递的任务在队列里没有任何区别，共享同一套优先级、重试、限流机制。
+
+---
+
+#### 典型使用场景
+
+| 场景 | every | job_type | Worker 做什么 |
+|---|---|---|---|
+| 每分钟心跳检测 | `1m` | `heartbeat` | ping 下游服务，写入检测结果 |
+| 每小时生成报告 | `1h` | `generate_report` | 查询数据库，生成 PDF/Excel |
+| 每天凌晨清理过期数据 | `1d` | `cleanup_expired` | DELETE 过期记录，释放空间 |
+| 每 5 分钟同步外部数据 | `5m` | `data_sync` | 调用第三方 API，写入本地 DB |
+| 每 30 分钟推送通知 | `30m` | `push_notification` | 查询待推送用户，批量发送消息 |
+
+---
+
+#### 创建与管理
 
 ```bash
 # 创建定时任务（每小时生成报告）
 curl -X POST http://localhost:8080/api/crons \
   -H "Content-Type: application/json" \
-  -d '{"name":"hourly-report","every":"1h","queue":"default","job_type":"generate_report","data":{"name":"hourly"}}'
+  -d '{
+    "name":         "hourly-report",
+    "every":        "1h",
+    "queue":        "default",
+    "job_type":     "generate_report",
+    "data":         {"name": "hourly"},
+    "priority":     5,
+    "max_attempts": 3
+  }'
 
 # 支持的时间单位：s（秒）、m（分钟）、h（小时）、d（天）、w（周）
 # 示例：30s / 5m / 2h / 1d / 1w
 
-# 查询所有定时任务
+# 查询所有定时任务（含 next_run_at / last_run_at）
 curl http://localhost:8080/api/crons
 
-# 更新定时任务
+# 暂停定时任务（不再触发，但不删除）
+curl -X PATCH http://localhost:8080/api/crons/1 \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": false}'
+
+# 恢复定时任务
+curl -X PATCH http://localhost:8080/api/crons/1 \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": true}'
+
+# 更新定时任务（修改间隔 / 参数）
 curl -X PUT http://localhost:8080/api/crons/1 \
   -H "Content-Type: application/json" \
   -d '{"name":"hourly-report","every":"2h","queue":"default","job_type":"generate_report","data":{}}'
@@ -1308,6 +1369,85 @@ curl -X PUT http://localhost:8080/api/crons/1 \
 # 删除定时任务
 curl -X DELETE http://localhost:8080/api/crons/1
 ```
+
+---
+
+#### 请求字段说明
+
+| 字段 | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `name` | string | 否 | — | 便于识别的名称，不影响执行 |
+| `every` | string | **是** | — | 执行间隔，如 `30s` / `5m` / `1h` / `1d` |
+| `queue` | string | **是** | — | 任务投递到哪个队列 |
+| `job_type` | string | **是** | — | Worker 侧用于路由的任务类型标识 |
+| `data` | object | 否 | `{}` | 每次触发时传给 Worker 的 JSON 数据 |
+| `priority` | int | 否 | `5` | 投递任务的优先级（1-10，越大越优先） |
+| `max_attempts` | int | 否 | `3` | 任务失败后最多重试次数 |
+
+---
+
+#### Cron 响应字段说明
+
+```json
+{
+  "id":           1,
+  "name":         "hourly-report",
+  "every":        "1h",
+  "queue":        "default",
+  "job_type":     "generate_report",
+  "data":         {"name": "hourly"},
+  "priority":     5,
+  "max_attempts": 3,
+  "enabled":      true,
+  "created_at":   1713340800,
+  "last_run_at":  1713344400,
+  "next_run_at":  1713348000
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `enabled` | `true` = 正常触发；`false` = 已暂停，不再投递任务 |
+| `last_run_at` | 上次触发的 Unix 时间戳（0 表示从未触发） |
+| `next_run_at` | 下次预计触发的 Unix 时间戳 |
+
+---
+
+#### Worker 侧无需任何改动
+
+Cron 投递的任务与手动投递的任务**格式完全相同**，Worker 只需注册对应的 `job_type` handler 即可，无需关心任务来源：
+
+```javascript
+// JS Worker 示例：注册 generate_report handler
+// 无论任务来自 Cron 自动触发还是手动 POST /api/jobs，处理逻辑完全一致
+handlers['generate_report'] = async (data, tags) => {
+  console.log(`生成报告: ${data.name}`);
+  // ... 业务逻辑 ...
+  return `报告 ${data.name} 生成完成`;
+};
+```
+
+```python
+# Python Worker 示例
+@worker.handler('generate_report')
+async def handle_generate_report(data, tags):
+    print(f"生成报告: {data['name']}")
+    # ... 业务逻辑 ...
+    return f"报告 {data['name']} 生成完成"
+```
+
+---
+
+#### 可视化管理（cron-dashboard）
+
+`examples/cron-dashboard/index.html` 提供了一个纯浏览器的 Cron 管理界面，无需安装任何依赖：
+
+- 创建 / 暂停 / 恢复 / 删除定时任务
+- 查看上次触发时间和下次触发倒计时
+- 一键「立即触发」（手动向队列投递一次任务，不影响定时计划）
+- 每 5 秒自动轮询，检测到触发时实时显示日志
+
+访问方式：在 `/dir` 文件浏览器中找到 `examples/cron-dashboard/index.html`，点击即可在新标签页打开。
 
 ---
 
