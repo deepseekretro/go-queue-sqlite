@@ -233,7 +233,7 @@ func handleCrons(w http.ResponseWriter, r *http.Request) {
 		}
 		now := time.Now().Unix()
 		nextRun := now + int64(d.Seconds())
-		res, err := db.Exec(
+		res, err := dbExecResult(
 			`INSERT INTO cron_jobs (name,queue,job_type,data,every,max_attempts,priority,enabled,next_run_at,created_at) VALUES (?,?,?,?,?,?,?,1,?,?)`,
 			req.Name, req.Queue, req.JobType, dataStr, req.Every, req.MaxAttempts, req.Priority, nextRun, now,
 		)
@@ -298,7 +298,7 @@ func handleCronItem(w http.ResponseWriter, r *http.Request) {
 		if len(data) == 0 {
 			data = json.RawMessage("{}")
 		}
-		_, err = db.Exec(
+		err = dbExec(
 			`UPDATE cron_jobs SET name=?,queue=?,job_type=?,data=?,every=?,max_attempts=?,priority=? WHERE id=?`,
 			req.Name, req.Queue, req.JobType, string(data), req.Every, req.MaxAttempts, req.Priority, id,
 		)
@@ -308,7 +308,7 @@ func handleCronItem(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonResp(w, 200, map[string]interface{}{"id": id, "updated": true})
 	case http.MethodDelete:
-		db.Exec(`DELETE FROM cron_jobs WHERE id=?`, id)
+		dbExec(`DELETE FROM cron_jobs WHERE id=?`, id) //nolint
 		jsonResp(w, 200, map[string]string{"message": "cron deleted"})
 	case http.MethodPatch:
 		// toggle enabled
@@ -321,7 +321,7 @@ func handleCronItem(w http.ResponseWriter, r *http.Request) {
 			if *req.Enabled {
 				v = 1
 			}
-			db.Exec(`UPDATE cron_jobs SET enabled=? WHERE id=?`, v, id)
+			dbExec(`UPDATE cron_jobs SET enabled=? WHERE id=?`, v, id) //nolint
 			jsonResp(w, 200, map[string]interface{}{"id": id, "enabled": *req.Enabled})
 		} else {
 			jsonResp(w, 400, map[string]string{"error": "enabled field required"})
@@ -392,6 +392,6 @@ func runDueCrons() {
 		}
 
 		// 更新 last_run_at 和 next_run_at
-		db.Exec(`UPDATE cron_jobs SET last_run_at=?, next_run_at=? WHERE id=?`, now, nextRun, cr.id)
+		dbExec(`UPDATE cron_jobs SET last_run_at=?, next_run_at=? WHERE id=?`, now, nextRun, cr.id) //nolint
 	}
 }

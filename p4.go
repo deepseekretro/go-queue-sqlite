@@ -167,6 +167,6 @@ func dispatchJobWithTags(jobID int64, tags []string) {
 	if tagsStr == "" {
 		return
 	}
-	db.Exec(`UPDATE jobs SET tags=? WHERE id=?`, tagsStr, jobID)
+	dbExec(`UPDATE jobs SET tags=? WHERE id=?`, tagsStr, jobID) //nolint
 }
 

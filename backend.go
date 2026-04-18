@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"log"
 	"net/http"
 	"time"
@@ -132,35 +133,28 @@ func handleDBReset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 在事务中执行所有清空操作
-	tx, err := db.Begin()
-	if err != nil {
-		jsonResp(w, 500, map[string]string{"error": "begin tx: " + err.Error()})
-		return
-	}
-	defer tx.Rollback()
-
-	stmts := []string{
-		"DELETE FROM jobs",
-		"DELETE FROM sqlite_sequence WHERE name='jobs'",
-		"DELETE FROM batches",
-		"DELETE FROM sqlite_sequence WHERE name='batches'",
-		"DELETE FROM job_chains",
-		"DELETE FROM sqlite_sequence WHERE name='job_chains'",
-	}
-	for _, s := range stmts {
-		if _, err := tx.Exec(s); err != nil {
-			// sqlite_sequence 行不存在时忽略错误（表可能从未插入过数据）
-			if s[:6] != "DELETE" || err.Error() != "no such table: sqlite_sequence" {
-				// 只忽略 sqlite_sequence 相关的"no such table"错误
-			}
+	// 通过 writer goroutine 串行化，避免与其他写操作并发
+	err := dbTxFunc(func(tx *sql.Tx) error {
+		stmts := []string{
+			"DELETE FROM jobs",
+			"DELETE FROM sqlite_sequence WHERE name='jobs'",
+			"DELETE FROM batches",
+			"DELETE FROM sqlite_sequence WHERE name='batches'",
+			"DELETE FROM job_chains",
+			"DELETE FROM sqlite_sequence WHERE name='job_chains'",
 		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		jsonResp(w, 500, map[string]string{"error": "commit: " + err.Error()})
+		for _, s := range stmts {
+			tx.Exec(s) //nolint: 忽略 sqlite_sequence 不存在的错误
+		}
+		return nil
+	})
+	if err != nil {
+		jsonResp(w, 500, map[string]string{"error": "reset: " + err.Error()})
 		return
 	}
+
+	// WAL checkpoint：把 WAL 文件合并回主库并截断，防止 WAL 膨胀拖慢后续写入
+	db.Exec("PRAGMA wal_checkpoint(TRUNCATE)") //nolint
 
 	log.Printf("[API] Database reset by admin")
 	jsonResp(w, 200, map[string]interface{}{

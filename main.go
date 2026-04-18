@@ -25,6 +25,87 @@ import (
 
 var db *sql.DB
 
+// ─────────────────────────────────────────────
+// DB Writer — 显式写 channel，单一 goroutine 串行执行所有写操作
+// 读操作（SELECT）直接用 db，可并发；写操作通过 dbExec/dbTxFunc 排队
+// ─────────────────────────────────────────────
+
+// dbWriteReq 封装一次写操作请求
+type dbWriteReq struct {
+	fn     func() error   // 实际执行的写操作（在 writer goroutine 中调用）
+	result chan error      // 写操作完成后把 error 发回给调用方
+}
+
+// dbWriteCh 是写操作的排队 channel，缓冲 512 防止短暂突发阻塞
+var dbWriteCh = make(chan dbWriteReq, 512)
+
+// startDBWriter 启动单一 writer goroutine，串行消费 dbWriteCh
+// 必须在 initDB() 之后、其他 goroutine 启动之前调用
+func startDBWriter() {
+	go func() {
+		for req := range dbWriteCh {
+			req.result <- req.fn()
+		}
+	}()
+	log.Println("[DBWriter] Started — all writes serialized via channel")
+}
+
+// dbExec 通过写 channel 执行单条写 SQL，等待结果返回
+// 用于替代直接调用 db.Exec(...)
+func dbExec(query string, args ...interface{}) error {
+	result := make(chan error, 1)
+	dbWriteCh <- dbWriteReq{
+		fn: func() error {
+			_, err := db.Exec(query, args...)
+			return err
+		},
+		result: result,
+	}
+	return <-result
+}
+
+// dbExecResult 通过写 channel 执行单条写 SQL，返回 sql.Result 和 error
+// 用于需要 LastInsertId / RowsAffected 的场景
+func dbExecResult(query string, args ...interface{}) (sql.Result, error) {
+	type resultPair struct {
+		res sql.Result
+		err error
+	}
+	resultCh := make(chan resultPair, 1)
+	result := make(chan error, 1)
+	dbWriteCh <- dbWriteReq{
+		fn: func() error {
+			res, err := db.Exec(query, args...)
+			resultCh <- resultPair{res, err}
+			return err
+		},
+		result: result,
+	}
+	p := <-resultCh
+	return p.res, p.err
+}
+
+// dbTxFunc 通过写 channel 执行一个事务函数（BEGIN → fn(tx) → COMMIT/ROLLBACK）
+// fn 在 writer goroutine 中串行执行，保证事务原子性且无锁竞争
+func dbTxFunc(fn func(*sql.Tx) error) error {
+	result := make(chan error, 1)
+	dbWriteCh <- dbWriteReq{
+		fn: func() error {
+			tx, err := db.Begin()
+			if err != nil {
+				return err
+			}
+			if err := fn(tx); err != nil {
+				tx.Rollback()
+				return err
+			}
+			return tx.Commit()
+		},
+		result: result,
+	}
+	return <-result
+}
+
 // initLogger 根据环境变量 LOG_FORMAT 决定日志格式
 // LOG_FORMAT=json  → JSON 结构化日志（生产推荐）
 // LOG_FORMAT=text  → 人类可读文本（默认，开发友好）
@@ -53,11 +134,14 @@ func (slogWriter) Write(p []byte) (n int, err error) {
 
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite", "./queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
+	db, err = sql.Open("sqlite", "./queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)")
 	if err != nil {
 		log.Fatal(err)
 	}
-	db.SetMaxOpenConns(1)
+	// 写操作通过 dbWriteCh 单 goroutine 串行执行，读操作可并发
+	// 设置 MaxOpenConns=4：1个写连接 + 多个读连接，充分利用 WAL 并发读
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 
 	// 建表（首次运行）
 	schema := `
@@ -155,28 +239,29 @@ func dispatchJobRaw(queue string, rawPayload string, delaySeconds int64, opts ..
 	prio := 5
 	var dedupKey *string
 	if len(opts) > 0 {
-		if opts[0].Priority >= 1 && opts[0].Priority <= 10 {
-			prio = opts[0].Priority
-		}
-		if opts[0].DedupKey != "" {
-			dedupKey = &opts[0].DedupKey
-		}
+	if opts[0].Priority >= 1 && opts[0].Priority <= 10 {
+	prio = opts[0].Priority
 	}
-	res, err := db.Exec(
-		`INSERT OR IGNORE INTO jobs (queue, payload, status, priority, dedup_key, available_at, created_at, updated_at)
-		 VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`,
-		queue, rawPayload, prio, dedupKey, now+delaySeconds, now, now,
+	if opts[0].DedupKey != "" {
+	dedupKey = &opts[0].DedupKey
+	}
+	}
+	res, err := dbExecResult(
+	`INSERT OR IGNORE INTO jobs (queue, payload, status, priority, dedup_key, available_at, created_at, updated_at)
+	VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`,
+	queue, rawPayload, prio, dedupKey, now+delaySeconds, now, now,
 	)
 	if err != nil {
-		return 0, err
+	return 0, err
 	}
 	id, _ := res.LastInsertId()
 	rows, _ := res.RowsAffected()
 	if rows == 0 {
-		return 0, nil
+	return 0, nil
 	}
 	return id, nil
 }
+
 
 // dispatchJob 构造 payload 并投递任务（内部 Go 代码使用，支持 timeout_sec / max_attempts）
 func dispatchJob(queue string, jobType string, data interface{}, delaySeconds int64, opts ...DispatchOptions) (int64, error) {
@@ -190,39 +275,105 @@ func dispatchJob(queue string, jobType string, data interface{}, delaySeconds in
 }
 
 func reserve(queue string) (*Job, error) {
-	tx, err := db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	now := time.Now().Unix()
-	row := tx.QueryRow(
-		`SELECT id, queue, payload, attempts, status, priority, available_at, started_at, finished_at, created_at, updated_at
-		 FROM jobs WHERE queue=? AND status='pending' AND available_at<=?
-		 ORDER BY priority DESC, id ASC LIMIT 1`,
-		queue, now,
-	)
-	var j Job
-	if err := row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority,
-		&j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
+	var result *Job
+	err := dbTxFunc(func(tx *sql.Tx) error {
+		now := time.Now().Unix()
+		row := tx.QueryRow(
+			`SELECT id, queue, payload, attempts, status, priority, available_at, started_at, finished_at, created_at, updated_at
+			 FROM jobs WHERE queue=? AND status='pending' AND available_at<=?
+			 ORDER BY priority DESC, id ASC LIMIT 1`,
+			queue, now,
+		)
+		var j Job
+		if err := row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority,
+			&j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt); err != nil {
+			if err == sql.ErrNoRows {
+				return nil
+			}
+			return err
 		}
-		return nil, err
+		if _, err := tx.Exec(
+			`UPDATE jobs SET status='running', attempts=attempts+1, started_at=?, updated_at=? WHERE id=?`,
+			now, now, j.ID,
+		); err != nil {
+			return err
+		}
+		j.Status = "running"
+		j.Attempts++
+		j.StartedAt = now
+		result = &j
+		return nil
+	})
+	return result, err
+}
+
+// reserveBatch 一次性取最多 n 个 pending 任务并标记为 running
+// 用于批量派发，减少 DB 事务次数
+func reserveBatch(queue string, n int) ([]*Job, error) {
+	if n <= 0 {
+		return nil, nil
 	}
-	if _, err = tx.Exec(
-		`UPDATE jobs SET status='running', attempts=attempts+1, started_at=?, updated_at=? WHERE id=?`,
-		now, now, j.ID,
-	); err != nil {
-		return nil, err
+
+	type result struct {
+		jobs []*Job
+		err  error
 	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
+	resultCh := make(chan result, 1)
+
+	// 把 SELECT + UPDATE 全部放入 writer goroutine，原子执行，消除并发写冲突
+	dbWriteCh <- dbWriteReq{
+		fn: func() error {
+			now := time.Now().Unix()
+			rows, err := db.Query(
+				`SELECT id, queue, payload, attempts, status, priority, available_at, started_at, finished_at, created_at, updated_at
+				FROM jobs WHERE queue=? AND status='pending' AND available_at<=?
+				ORDER BY priority DESC, id ASC LIMIT ?`,
+				queue, now, n,
+			)
+			if err != nil {
+				resultCh <- result{nil, err}
+				return err
+			}
+			var candidates []*Job
+			for rows.Next() {
+				var j Job
+				if err := rows.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority,
+					&j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt); err != nil {
+					continue
+				}
+				candidates = append(candidates, &j)
+			}
+			rows.Close()
+			if len(candidates) == 0 {
+				resultCh <- result{nil, nil}
+				return nil
+			}
+			// 批量 UPDATE（在同一 writer goroutine 里，无并发冲突）
+			var jobs []*Job
+			for _, j := range candidates {
+				res, err := db.Exec(
+					`UPDATE jobs SET status='running', attempts=attempts+1, started_at=?, updated_at=? WHERE id=? AND status='pending'`,
+					now, now, j.ID,
+				)
+				if err != nil {
+					continue
+				}
+				affected, _ := res.RowsAffected()
+				if affected == 0 {
+					continue
+				}
+				j.Status = "running"
+				j.Attempts++
+				j.StartedAt = now
+				jobs = append(jobs, j)
+			}
+			resultCh <- result{jobs, nil}
+			return nil
+		},
+		result: make(chan error, 1),
 	}
-	j.Status = "running"
-	j.Attempts++
-	j.StartedAt = now
-	return &j, nil
+	r := <-resultCh
+	return r.jobs, r.err
 }
 
 const (
@@ -234,21 +385,18 @@ const (
 var (
 	// WsJobTimeoutSec：WS Worker 处理单个任务的最长等待时间（秒）
 	// 环境变量：WS_JOB_TIMEOUT_SEC，默认 300（5 分钟）
-	// 调用 AI API 等长耗时任务可设置更大的值，例如 3600（1 小时）
 	WsJobTimeoutSec = 300
 
 	// StaleJobTimeout：Stale Job Reaper 判定任务卡死的阈值（秒）
 	// 环境变量：STALE_JOB_TIMEOUT_SEC，默认 300（5 分钟）
-	// 应 >= WsJobTimeoutSec，否则任务还没超时就被 Reaper 放回 pending
 	StaleJobTimeout = 300
 
 	// DefaultJobTimeoutSec：内置 GoWorker 单任务默认超时（秒）
 	// 环境变量：DEFAULT_JOB_TIMEOUT_SEC，默认 60
-	// per-job 的 timeout_sec 字段优先级更高
 	DefaultJobTimeoutSec = 60
 )
 
-// initTimeouts 从环境变量读取超时配置，在 main() 最开始调用
+
 func initTimeouts() {
 	if v := os.Getenv("WS_JOB_TIMEOUT_SEC"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -273,9 +421,11 @@ func initTimeouts() {
 var workerWg sync.WaitGroup
 
 func markDone(id int64) {
-	now := time.Now().Unix()
-	db.Exec(`UPDATE jobs SET status='done', finished_at=?, updated_at=? WHERE id=?`, now, now, id)
-	broadcastStats()
+	go func() {
+		now := time.Now().Unix()
+		dbExec(`UPDATE jobs SET status='done', finished_at=?, updated_at=? WHERE id=?`, now, now, id) //nolint
+		broadcastStats()
+	}()
 }
 
 // handleJobFailure：失败时先判断是否还有重试机会
@@ -305,16 +455,16 @@ func handleJobFailure(j *Job, reason string) {
 			delaySec = int64(1<<uint(j.Attempts-1)) * RetryBaseDelaySec
 		}
 		availAt := now + delaySec
-		db.Exec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE id=?`,
-			availAt, now, j.ID)
+		dbExec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE id=?`,
+			availAt, now, j.ID) //nolint
 		log.Printf("[Queue] Job #%d will retry (attempt %d/%d) in %ds — reason: %s",
 			j.ID, j.Attempts, maxAttempts, delaySec, reason)
 	} else {
 		// 超过最大重试次数，进死信队列
 		jobType := j.JobType()
-		db.Exec(`UPDATE jobs SET status='failed', finished_at=?, updated_at=? WHERE id=?`, now, now, j.ID)
-		db.Exec(`INSERT INTO failed_jobs (queue, job_type, payload, attempts, exception, failed_at) VALUES (?,?,?,?,?,?)`,
-			j.Queue, jobType, j.Payload, j.Attempts, reason, now)
+		dbExec(`UPDATE jobs SET status='failed', finished_at=?, updated_at=? WHERE id=?`, now, now, j.ID)         //nolint
+		dbExec(`INSERT INTO failed_jobs (queue, job_type, payload, attempts, exception, failed_at) VALUES (?,?,?,?,?,?)`,
+			j.Queue, jobType, j.Payload, j.Attempts, reason, now) //nolint
 		log.Printf("[Queue] Job #%d → DLQ after %d attempts — reason: %s", j.ID, j.Attempts, reason)
 	}
 	broadcastStats()
@@ -373,6 +523,34 @@ type WorkerHub struct {
 
 var hub = &WorkerHub{workers: make(map[string]*WsWorker)}
 
+// notifyDispatcher: per-queue 通知 channel，投递新任务或 worker 变 idle 时发信号
+// dispatcher 收到信号后立即尝试取任务，无需等待 sleep
+var (
+	notifyMu          sync.Mutex
+	notifyDispatchMap = make(map[string]chan struct{})
+)
+
+// getNotifyCh 获取（或创建）指定队列的通知 channel
+func getNotifyCh(queue string) chan struct{} {
+	notifyMu.Lock()
+	defer notifyMu.Unlock()
+	if ch, ok := notifyDispatchMap[queue]; ok {
+		return ch
+	}
+	ch := make(chan struct{}, 64)
+	notifyDispatchMap[queue] = ch
+	return ch
+}
+
+// notifyQueue 向指定队列的 dispatcher 发送非阻塞通知
+func notifyQueue(queue string) {
+	ch := getNotifyCh(queue)
+	select {
+	case ch <- struct{}{}:
+	default: // 已有信号在队列中，忽略
+	}
+}
+
 func (h *WorkerHub) register(w *WsWorker) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -429,6 +607,19 @@ func (h *WorkerHub) countForQueue(queue string) int {
 	count := 0
 	for _, w := range h.workers {
 		if w.queue == queue {
+			count++
+		}
+	}
+	return count
+}
+
+// idleCountForQueue 返回指定队列的空闲 worker 数量
+func (h *WorkerHub) idleCountForQueue(queue string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	count := 0
+	for _, w := range h.workers {
+		if w.queue == queue && w.idle {
 			count++
 		}
 	}
@@ -504,46 +695,69 @@ func (h *WorkerHub) dispatchToWs(j *Job) bool {
 	return false
 }
 
-// WS dispatcher: polls DB and sends to connected WS workers
+// WS dispatcher: event-driven + batch reserve
 // startWsDispatcher 为指定队列启动一个 WS 派发 goroutine
+// 优化：通知驱动（投递/完成时立即唤醒）+ 批量取任务 + 50ms 兜底轮询
 func startWsDispatcher(queue string) {
+	notifyCh := getNotifyCh(queue)
 	go func() {
 		for {
 			select {
 			case <-stopGoWorker:
 				return
-			default:
+			case <-notifyCh:
+				// 收到通知，立即尝试派发
+			case <-time.After(100 * time.Millisecond):
+				// 兜底轮询，100ms 间隔，提高响应速度
 			}
+
 			// P3-A: 队列暂停时跳过派发
 			if isQueuePaused(queue) {
-				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-			if hub.countForQueue(queue) == 0 {
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			j, err := reserve(queue)
-			if err != nil {
-				log.Printf("[WsDispatcher] reserve error: %v", err)
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			if j == nil {
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-			if !hub.dispatchToWs(j) {
-				db.Exec(`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=? WHERE id=?`,
-					time.Now().Unix(), j.ID)
-				time.Sleep(500 * time.Millisecond)
+
+			// 循环派发：只要有空闲 worker 且有待处理任务，就持续派发
+			for {
+				// 计算当前空闲 worker 数，批量取任务
+				idleCount := hub.idleCountForQueue(queue)
+				if idleCount == 0 {
+					break
+				}
+
+				// 批量取任务（最多取 idleCount 个，上限 32）
+				batchSize := idleCount
+				if batchSize > 32 {
+					batchSize = 32
+				}
+				jobs, err := reserveBatch(queue, batchSize)
+				if err != nil {
+					log.Printf("[WsDispatcher] reserveBatch error: %v", err)
+					break
+				}
+				if len(jobs) == 0 {
+					break
+				}
+
+				// 逐个派发给空闲 worker
+				dispatched := 0
+				for _, j := range jobs {
+					if !hub.dispatchToWs(j) {
+						// 没有空闲 worker 了，放回 pending
+						dbExec(`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=? WHERE id=?`,
+							time.Now().Unix(), j.ID) //nolint
+					} else {
+						dispatched++
+					}
+				}
+				// 如果本轮没有成功派发任何任务，退出循环避免空转
+				if dispatched == 0 {
+					break
+				}
 			}
 		}
 	}()
-	log.Printf("[WsDispatcher] Started for queue=%s", queue)
+	log.Printf("[WsDispatcher] Started for queue=%s (event-driven+batch)", queue)
 }
-
-// startDynamicWsDispatcher 监控 hub，当有新队列的 WS Worker 连接时自动启动 dispatcher
 func startDynamicWsDispatcher() {
 	go func() {
 		started := map[string]bool{}
@@ -637,8 +851,8 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 		jobID := worker.currentJobID
 		hub.mu.Unlock()
 		if jobID > 0 {
-			db.Exec(`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=? WHERE id=? AND status='running'`,
-				time.Now().Unix(), jobID)
+			dbExec(`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=? WHERE id=? AND status='running'`,
+				time.Now().Unix(), jobID) //nolint
 			log.Printf("[WS] Worker %s %s — job #%d put back to pending", workerID, reason, jobID)
 		}
 	}
@@ -678,6 +892,8 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 				worker.currentJobID = 0
 				worker.timeoutSec = 0
 				hub.mu.Unlock()
+				// worker 变为 idle，立即通知 dispatcher 可以派发下一个任务
+				notifyQueue(worker.queue)
 				if result.Success {
 					markDone(result.JobID)
 					log.Printf("[WS] Job #%d done by worker %s: %s", result.JobID, workerID, result.Log)
@@ -722,7 +938,7 @@ func startStaleJobReaper() {
 		for {
 			time.Sleep(30 * time.Second)
 			threshold := time.Now().Unix() - int64(StaleJobTimeout)
-			res, err := db.Exec(
+			res, err := dbExecResult(
 				`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=?
 				 WHERE status='running' AND updated_at<?`,
 				time.Now().Unix(), threshold,
@@ -895,7 +1111,7 @@ func handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 只允许取消 pending 状态的任务
-	res, err := db.Exec(`UPDATE jobs SET status='cancelled', updated_at=? WHERE id=? AND status='pending'`,
+	res, err := dbExecResult(`UPDATE jobs SET status='cancelled', updated_at=? WHERE id=? AND status='pending'`,
 		time.Now().Unix(), id)
 	if err != nil {
 		jsonResp(w, 500, map[string]string{"error": err.Error()})
@@ -985,12 +1201,14 @@ func handleDispatch(w http.ResponseWriter, r *http.Request) {
 	// P2-3: 写入 next_job 到 jobs 表
 	if req.NextJob != nil {
 		nextJobBytes, _ := json.Marshal(req.NextJob)
-		db.Exec(`UPDATE jobs SET next_job=? WHERE id=?`, string(nextJobBytes), id)
+		dbExec(`UPDATE jobs SET next_job=? WHERE id=?`, string(nextJobBytes), id) //nolint
 	}
 	// P4: 写入 tags
 	if len(req.Tags) > 0 {
 		dispatchJobWithTags(id, req.Tags)
 	}
+	// 通知 dispatcher 有新任务到达，立即唤醒（无需等待轮询间隔）
+	notifyQueue(req.Queue)
 	jsonResp(w, 201, map[string]interface{}{"job_id": id, "queue": req.Queue, "status": "pending"})
 }
 
@@ -1086,7 +1304,7 @@ func handleClearFailed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	db.Exec(`DELETE FROM failed_jobs`)
+	dbExec(`DELETE FROM failed_jobs`) //nolint
 	jsonResp(w, 200, map[string]string{"message": "failed jobs cleared"})
 }
 
@@ -1096,7 +1314,7 @@ func handleRetryFailed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	db.Exec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE status='failed'`, now, now)
+	dbExec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE status='failed'`, now, now) //nolint
 	jsonResp(w, 200, map[string]string{"message": "failed jobs re-queued"})
 }
 
@@ -1287,6 +1505,7 @@ func main() {
 	initTimeouts()
 	initLogger()
 	initDB()
+	startDBWriter() // 启动单一 writer goroutine，所有写操作通过 channel 串行化
 	initBatchDB()
 	initCronDB()
 	startCronScheduler()

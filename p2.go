@@ -150,8 +150,8 @@ func checkRateLimit(j *Job) bool {
 	}
 	// 超限：放回 pending，延迟 60s 重试
 	now := time.Now().Unix()
-	db.Exec(`UPDATE jobs SET status='pending', attempts=attempts-1, available_at=?, updated_at=? WHERE id=?`,
-		now+60, now, j.ID)
+	dbExec(`UPDATE jobs SET status='pending', attempts=attempts-1, available_at=?, updated_at=? WHERE id=?`,
+		now+60, now, j.ID) //nolint
 	log.Printf("[RateLimit] job #%d type=%s rate limited, rescheduled in 60s", j.ID, p.JobType)
 	return true
 }
@@ -379,7 +379,7 @@ func dispatchChainedJob(nextJobJSON string) {
 // markDoneWithChain 完成任务并触发链式任务
 func markDoneWithChain(id int64, nextJobJSON string) {
 	now := time.Now().Unix()
-	db.Exec(`UPDATE jobs SET status='done', finished_at=?, updated_at=? WHERE id=?`, now, now, id)
+	dbExec(`UPDATE jobs SET status='done', finished_at=?, updated_at=? WHERE id=?`, now, now, id) //nolint
 	broadcastStats()
 	// 触发链式任务
 	if nextJobJSON != "" {
@@ -461,7 +461,7 @@ func containsStrHelper(s, sub string) bool {
 // createBatch 创建一个批次，返回 batch_id
 func createBatch(name string, thenJobJSON string, catchJobJSON string, finallyJobJSON string) (int64, error) {
 	now := time.Now().Unix()
-	res, err := db.Exec(
+	res, err := dbExecResult(
 		`INSERT INTO job_batches (name, total, then_job, catch_job, finally_job, status, created_at) VALUES (?, 0, ?, ?, ?, 'pending', ?)`,
 		name, thenJobJSON, catchJobJSON, finallyJobJSON, now,
 	)
@@ -473,11 +473,11 @@ func createBatch(name string, thenJobJSON string, catchJobJSON string, finallyJo
 
 // addJobToBatch 将任务关联到批次，并更新批次 total
 func addJobToBatch(jobID int64, batchID int64) error {
-	_, err := db.Exec(`UPDATE jobs SET batch_id=? WHERE id=?`, batchID, jobID)
+	err := dbExec(`UPDATE jobs SET batch_id=? WHERE id=?`, batchID, jobID)
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`UPDATE job_batches SET total=total+1 WHERE id=?`, batchID)
+	err = dbExec(`UPDATE job_batches SET total=total+1 WHERE id=?`, batchID)
 	return err
 }
 
@@ -497,7 +497,7 @@ func checkBatchCompletion(jobID int64) {
 
 	if done+failed < total {
 		// 批次未完成
-		db.Exec(`UPDATE job_batches SET status='running' WHERE id=? AND status='pending'`, batchID)
+		dbExec(`UPDATE job_batches SET status='running' WHERE id=? AND status='pending'`, batchID) //nolint
 		return
 	}
 	// 批次全部完成
@@ -506,7 +506,7 @@ func checkBatchCompletion(jobID int64) {
 	if failed > 0 {
 		finalStatus = "failed"
 	}
-	db.Exec(`UPDATE job_batches SET status=?, finished_at=? WHERE id=?`, finalStatus, now, batchID)
+	dbExec(`UPDATE job_batches SET status=?, finished_at=? WHERE id=?`, finalStatus, now, batchID) //nolint
 	log.Printf("[Batch] Batch #%d completed: status=%s total=%d done=%d failed=%d",
 		batchID, finalStatus, total, done, failed)
 
