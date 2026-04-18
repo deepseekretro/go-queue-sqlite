@@ -411,7 +411,19 @@ const dirHTML = `<!DOCTYPE html>
   .size { font-family: monospace; color: #94a3b8; }
 
   /* ── 预览弹窗 ── */
-  dialog {
+  /* 遮罩层：全屏半透明背景，flex 居中 */
+  #previewOverlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.65);
+    backdrop-filter: blur(3px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  /* 弹窗容器 */
+  #previewDialog {
     background: #1e293b;
     border: 1px solid #334155;
     border-radius: 14px;
@@ -422,10 +434,10 @@ const dirHTML = `<!DOCTYPE html>
     box-shadow: 0 25px 60px rgba(0,0,0,0.6);
     display: flex;
     flex-direction: column;
-    /* 拖拽用 transform，不改变 position，保持浏览器默认居中 */
+    /* 拖拽用 transform */
     transform: translate(0px, 0px);
+    position: relative;
   }
-  dialog::backdrop { background: rgba(0,0,0,0.65); backdrop-filter: blur(3px); }
   /* 只有 dialog-title 区域是拖拽手柄，按钮不受影响 */
   .dialog-title { cursor: grab; user-select: none; flex: 1; }
   .dialog-title:active { cursor: grabbing; }
@@ -450,9 +462,8 @@ const dirHTML = `<!DOCTYPE html>
   .dialog-dl-btn:hover { background: #2563eb; color: #fff; }
   .dialog-close {
     background: none; border: none; color: #64748b;
-    font-size: 1.3rem; cursor: pointer !important; padding: 2px 6px;
+    font-size: 1.3rem; cursor: pointer; padding: 2px 6px;
     border-radius: 6px; transition: all 0.15s; line-height: 1;
-    pointer-events: auto !important; position: relative; z-index: 10;
     flex-shrink: 0;
   }
   .dialog-close:hover { background: #334155; color: #e2e8f0; }
@@ -554,40 +565,56 @@ const dirHTML = `<!DOCTYPE html>
   </table>
 </main>
 
-<!-- 文本预览弹窗 -->
-<dialog id="previewDialog">
-  <div class="dialog-header">
-    <span style="font-size:1.1rem">📄</span>
-    <span class="dialog-title" id="dialogTitle">—</span>
-    <a href="#" class="dialog-dl-btn" id="dialogDlBtn" download>⬇ 下载</a>
-    <button class="dialog-close" id="dialogClose" title="关闭 (Esc)">✕</button>
+<!-- 文本预览弹窗（单实例，display:none/flex 控制显隐） -->
+<div id="previewOverlay" style="display:none">
+  <div id="previewDialog">
+    <div class="dialog-header">
+      <span style="font-size:1.1rem">📄</span>
+      <span class="dialog-title" id="dialogTitle">—</span>
+      <a href="#" class="dialog-dl-btn" id="dialogDlBtn" download>⬇ 下载</a>
+      <button class="dialog-close" id="dialogClose" title="关闭 (Esc)">✕</button>
+    </div>
+    <div class="dialog-body" id="dialogBody">
+      <div class="dialog-loading">加载中…</div>
+    </div>
+    <div class="dialog-footer" id="dialogFooter"></div>
   </div>
-  <div class="dialog-body" id="dialogBody">
-    <div class="dialog-loading">加载中…</div>
-  </div>
-  <div class="dialog-footer" id="dialogFooter"></div>
-</dialog>
+</div>
 
 <script>
 (function () {
-  const dialog = document.getElementById('previewDialog');
-  const dialogTitle = document.getElementById('dialogTitle');
-  const dialogBody = document.getElementById('dialogBody');
-  const dialogDlBtn = document.getElementById('dialogDlBtn');
-  const dialogFooter = document.getElementById('dialogFooter');
-  const dialogClose = document.getElementById('dialogClose');
+  var overlay  = document.getElementById('previewOverlay');
+  var dialogEl = document.getElementById('previewDialog');
+  var dialogTitle  = document.getElementById('dialogTitle');
+  var dialogBody   = document.getElementById('dialogBody');
+  var dialogDlBtn  = document.getElementById('dialogDlBtn');
+  var dialogFooter = document.getElementById('dialogFooter');
+  var dialogClose  = document.getElementById('dialogClose');
 
-  // 关闭弹窗
-  dialogClose.addEventListener('click', () => dialog.close());
-  dialog.addEventListener('click', e => { if (e.target === dialog) dialog.close(); });
-  document.addEventListener('keydown', e => { if (e.key === 'Escape' && dialog.open) dialog.close(); });
+  // ── 显示 / 隐藏 ──
+  function openOverlay()  { overlay.style.display = 'flex'; }
+  function closeOverlay() { overlay.style.display = 'none'; }
 
-  // ── 拖拽移动弹窗（用 transform: translate 实现，不影响 close()）──
-  // 拖拽手柄只绑定在 dialogTitle 上，按钮区域完全不受影响
-  // dialogTitle 已在顶部声明，此处直接使用
-  let isDragging = false;
-  let dragStartX = 0, dragStartY = 0;
-  let translateX = 0, translateY = 0;
+  // 关闭：✕ 按钮
+  dialogClose.addEventListener('click', function (e) {
+    e.stopPropagation();
+    closeOverlay();
+  });
+
+  // 关闭：点击遮罩背景（不是弹窗内部）
+  overlay.addEventListener('click', function (e) {
+    if (e.target === overlay) closeOverlay();
+  });
+
+  // 关闭：Esc 键
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape' && overlay.style.display !== 'none') closeOverlay();
+  });
+
+  // ── 拖拽（transform 方案，只绑定在 dialogTitle 上）──
+  var isDragging = false;
+  var dragStartX = 0, dragStartY = 0;
+  var translateX = 0, translateY = 0;
 
   dialogTitle.addEventListener('mousedown', function (e) {
     isDragging = true;
@@ -601,7 +628,7 @@ const dirHTML = `<!DOCTYPE html>
     if (!isDragging) return;
     translateX = e.clientX - dragStartX;
     translateY = e.clientY - dragStartY;
-    dialog.style.transform = 'translate(' + translateX + 'px, ' + translateY + 'px)';
+    dialogEl.style.transform = 'translate(' + translateX + 'px, ' + translateY + 'px)';
   });
 
   document.addEventListener('mouseup', function () {
@@ -611,47 +638,44 @@ const dirHTML = `<!DOCTYPE html>
     }
   });
 
-  // 点击文本文件链接
+  // ── 点击文本文件链接 → 打开预览 ──
   document.addEventListener('click', async function (e) {
-    const link = e.target.closest('.text-preview');
+    var link = e.target.closest('.text-preview');
     if (!link) return;
     e.preventDefault();
 
-    const rawURL = link.dataset.raw;
-    const fileName = link.dataset.name;
-    const dlURL = rawURL.replace('&raw=1', '');
+    var rawURL  = link.dataset.raw;
+    var fileName = link.dataset.name;
+    var dlURL   = rawURL.replace('&raw=1', '');
 
-    // 打开弹窗，显示加载状态
-    dialogTitle.textContent = fileName;
-    dialogDlBtn.href = dlURL;
-    dialogDlBtn.download = fileName;
-    dialogBody.innerHTML = '<div class="dialog-loading">⏳ 加载中…</div>';
-    dialogFooter.textContent = '';
-    // 每次打开重置拖拽偏移，浏览器自动居中
+    // 重置位置，显示加载状态
     translateX = 0;
     translateY = 0;
-    dialog.style.transform = 'translate(0px, 0px)';
-    dialog.showModal();
+    dialogEl.style.transform = 'translate(0px, 0px)';
+    dialogTitle.textContent  = fileName;
+    dialogDlBtn.href         = dlURL;
+    dialogDlBtn.download     = fileName;
+    dialogBody.innerHTML     = '<div class="dialog-loading">⏳ 加载中…</div>';
+    dialogFooter.textContent = '';
+    openOverlay();
 
     try {
-      const resp = await fetch(rawURL);
+      var resp = await fetch(rawURL);
       if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const text = await resp.text();
+      var text = await resp.text();
 
-      // 行号 + 代码
-      const lines = text.split('\n');
-      // 末尾空行不计入行号
-      const lineCount = lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+      var lines = text.split('\n');
+      var lineCount = (lines[lines.length - 1] === '') ? lines.length - 1 : lines.length;
 
-      const numCol = document.createElement('div');
+      var numCol = document.createElement('div');
       numCol.className = 'line-num-col';
-      numCol.textContent = Array.from({length: lineCount}, (_, i) => i + 1).join('\n');
+      numCol.textContent = Array.from({length: lineCount}, function(_, i){ return i + 1; }).join('\n');
 
-      const codeCol = document.createElement('div');
+      var codeCol = document.createElement('div');
       codeCol.className = 'line-code-col';
       codeCol.textContent = text;
 
-      const grid = document.createElement('div');
+      var grid = document.createElement('div');
       grid.className = 'line-nums';
       grid.appendChild(numCol);
       grid.appendChild(codeCol);
@@ -659,14 +683,11 @@ const dirHTML = `<!DOCTYPE html>
       dialogBody.innerHTML = '';
       dialogBody.appendChild(grid);
 
-      // 页脚信息
-      const bytes = new TextEncoder().encode(text).length;
-      dialogFooter.textContent =
-        lineCount + ' 行  ·  ' + formatSize(bytes) + '  ·  ' + fileName;
+      var bytes = new TextEncoder().encode(text).length;
+      dialogFooter.textContent = lineCount + ' 行  ·  ' + formatSize(bytes) + '  ·  ' + fileName;
 
     } catch (err) {
-      dialogBody.innerHTML =
-        '<div class="dialog-error">❌ 加载失败：' + escHtml(err.message) + '</div>';
+      dialogBody.innerHTML = '<div class="dialog-error">❌ 加载失败：' + escHtml(err.message) + '</div>';
     }
   });
 
