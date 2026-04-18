@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        YouTube 投递到 GoQueue 队列
 // @namespace   https://github.com/deepseekretro/go-queue-sqlite
-// @version     1.3.0
+// @version     1.4.0
 // @description 在 YouTube 首页/频道/搜索页/播放页添加「加入队列」按钮，点击后将视频信息投递到 GoQueue 任务队列
 // @author      GoQueue
 // @match       https://www.youtube.com/
@@ -29,7 +29,7 @@
   // 生产环境请修改为实际部署地址，例如：
   //   const GOQUEUE_HOST = 'https://your-server.example.com';
   //
-  const GOQUEUE_HOST = GM_getValue('goqueue_host', 'http://localhost:8080');
+  const GOQUEUE_HOST = (GM_getValue('goqueue_host', 'http://localhost:8080') || 'http://localhost:8080').replace(/\/+$/, '');
 
   // 投递到哪个队列
   const QUEUE_NAME   = GM_getValue('goqueue_queue', 'youtube');
@@ -224,18 +224,21 @@
           let jobId = '';
           try {
             const resp = JSON.parse(res.responseText);
-            jobId = resp.id ? ` #${resp.id}` : '';
-          } catch (_) {}
-          console.log(`✅ 投递成功，Job${jobId}，响应:`, res.responseText);
+            // 服务端返回: {"job_id": 123, "queue": "youtube", "status": "pending"}
+            jobId = resp.job_id ? ` #${resp.job_id}` : '';
+            console.log(`✅ 投递成功，Job${jobId}`, resp);
+          } catch (_) {
+            console.log('✅ 投递成功，响应:', res.responseText);
+          }
           showToast(`✅ 已加入队列${jobId}`);
           // 按钮变为「已加入」状态，防止重复投递
           if (button) {
             button.classList.add('goqueue-queued');
             button.disabled = true;
-            button.querySelector('span').textContent = '已加入';
+            button.querySelector('span').textContent = `已加入${jobId}`;
           }
         } else {
-          console.error('❌ 投递失败，状态码:', res.status, '响应:', res.responseText);
+          console.error('❌ 投递失败，状态码:', res.status, '\n响应:', res.responseText);
           showToast(`❌ 投递失败: ${res.status}`, false);
         }
       },
