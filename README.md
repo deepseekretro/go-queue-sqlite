@@ -46,6 +46,7 @@
 | JS Worker | Node.js | [examples/js-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/js-worker) |
 | Python Worker | Python | [examples/python-worker](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/python-worker) |
 | Tampermonkey 油猴脚本 | 浏览器 | [examples/tampermonkey](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/tampermonkey) |
+| YouTube → GoQueue | 浏览器油猴脚本 | [examples/youtube_queue](https://github.com/deepseekretro/go-queue-sqlite/tree/master/examples/youtube_queue) |
 
 ---
 
