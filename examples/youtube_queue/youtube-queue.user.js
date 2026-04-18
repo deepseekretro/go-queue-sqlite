@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name        YouTube 投递到 GoQueue 队列
 // @namespace   https://github.com/deepseekretro/go-queue-sqlite
-// @version     1.1.0
+// @version     1.2.0
 // @description 在 YouTube 首页/频道/搜索页/播放页添加「加入队列」按钮，点击后将视频信息投递到 GoQueue 任务队列
 // @author      GoQueue
 // @match       https://www.youtube.com/
@@ -238,6 +238,11 @@
   }
 
   // ─── 🔎 标题获取器（覆盖所有已知 YouTube DOM 变体）────────────────────────
+  //
+  // YouTube 类名有两套风格，需同时覆盖：
+  //   驼峰式（新版）: ytLockupMetadataViewModelHeadingReset
+  //   连字符式（旧版）: yt-lockup-metadata-view-model__heading-reset
+  //
   function getSafeTitle(context = null, isWatchPage = false) {
     let title = '';
 
@@ -267,27 +272,45 @@
     } else if (context) {
       // 列表页卡片：按优先级逐一尝试
 
-      // 1. 新版 lockup UI（2023+）
-      const heading = context.querySelector('.yt-lockup-metadata-view-model__heading-reset');
-      if (heading) {
-        title = heading.title || heading.textContent.trim();
+      // 1. 驼峰式类名（2025+ 新版，实测 DOM）
+      //    <h3 class="ytLockupMetadataViewModelHeadingReset" title="视频标题">
+      const camelHeading = context.querySelector('.ytLockupMetadataViewModelHeadingReset');
+      if (camelHeading) {
+        title = camelHeading.title || camelHeading.textContent.trim();
         if (title) return title;
       }
 
-      const lockupTitle = context.querySelector('.yt-lockup-metadata-view-model__title');
-      if (lockupTitle) {
-        title = lockupTitle.title || lockupTitle.textContent.trim();
+      //    <a class="ytLockupMetadataViewModelTitle" ...>
+      const camelTitleLink = context.querySelector('a.ytLockupMetadataViewModelTitle');
+      if (camelTitleLink) {
+        title = camelTitleLink.title
+             || camelTitleLink.getAttribute('aria-label')
+             || camelTitleLink.textContent.trim();
+        // aria-label 格式为 "标题 23 minutes"，去掉末尾时长
+        if (title) return title.replace(/\s+\d+\s+(minutes?|hours?|seconds?).*$/i, '').trim();
+      }
+
+      // 2. 连字符式类名（2023-2024 版本）
+      const hyphenHeading = context.querySelector('.yt-lockup-metadata-view-model__heading-reset');
+      if (hyphenHeading) {
+        title = hyphenHeading.title || hyphenHeading.textContent.trim();
         if (title) return title;
       }
 
-      // 2. lockup wiz（2024+）
-      const wizLink = context.querySelector('yt-lockup-view-model-wiz__metadata a, .yt-lockup-view-model-wiz__metadata a');
+      const hyphenTitleLink = context.querySelector('.yt-lockup-metadata-view-model__title');
+      if (hyphenTitleLink) {
+        title = hyphenTitleLink.title || hyphenTitleLink.textContent.trim();
+        if (title) return title;
+      }
+
+      // 3. lockup wiz（某些版本）
+      const wizLink = context.querySelector('.yt-lockup-view-model-wiz__metadata a');
       if (wizLink) {
         title = wizLink.title || wizLink.getAttribute('aria-label') || wizLink.textContent.trim();
         if (title) return title;
       }
 
-      // 3. 旧版 #video-title（yt-formatted-string 或普通元素）
+      // 4. 旧版 #video-title（yt-formatted-string 或普通元素）
       const videoTitleSelectors = [
         'yt-formatted-string#video-title',
         'span#video-title',
@@ -302,21 +325,26 @@
         }
       }
 
-      // 4. a#video-title-link
+      // 5. a#video-title-link
       const titleLink = context.querySelector('a#video-title-link');
       if (titleLink) {
         title = titleLink.title || titleLink.getAttribute('aria-label') || titleLink.textContent.trim();
         if (title) return title;
       }
 
-      // 5. 通用兜底：找卡片内 href 含 watch 的 <a> 且有 title/aria-label
+      // 6. 通用兜底：卡片内 href 含 watch 的 <a>，优先取 title 属性
       const watchLinks = context.querySelectorAll('a[href*="watch"]');
       for (const a of watchLinks) {
-        title = a.title || a.getAttribute('aria-label') || '';
+        title = a.title || '';
         if (title) return title;
       }
+      // aria-label 兜底（格式可能含时长，去掉）
+      for (const a of watchLinks) {
+        title = a.getAttribute('aria-label') || '';
+        if (title) return title.replace(/\s+\d+\s+(minutes?|hours?|seconds?).*$/i, '').trim();
+      }
 
-      // 6. 最后兜底：a#thumbnail 的 aria-label
+      // 7. 最后兜底：a#thumbnail 的 aria-label
       const thumb = context.querySelector('a#thumbnail');
       if (thumb) {
         title = thumb.getAttribute('aria-label') || thumb.title || '';
@@ -362,7 +390,8 @@
   function insertButtonToCard(card) {
     // 按优先级查找视频链接（覆盖新旧版 YouTube DOM）
     const urlSelectors = [
-      'a.yt-lockup-view-model__content-image',  // 新版 lockup
+      'a.ytLockupMetadataViewModelTitle',        // 2025+ 驼峰式（实测 DOM）
+      'a.yt-lockup-view-model__content-image',   // 连字符式 lockup
       'a.yt-lockup-view-model-wiz__content-image',
       'a#thumbnail',                             // 旧版
       'a[href*="watch"]',                        // 通用兜底
@@ -379,7 +408,8 @@
     if (card.querySelector('.goqueue-btn')) return;
 
     // 按优先级查找文字容器（按钮插入位置）
-    const textContainer = card.querySelector('.yt-lockup-metadata-view-model__text-container')
+    const textContainer = card.querySelector('.ytLockupMetadataViewModelTextContainer')  // 2025+ 驼峰式
+                        || card.querySelector('.yt-lockup-metadata-view-model__text-container')
                         || card.querySelector('.yt-lockup-view-model-wiz__metadata')
                         || card.querySelector('#meta')
                         || card.querySelector('#details')
