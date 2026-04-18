@@ -32,29 +32,185 @@ var db *sql.DB
 
 // dbWriteReq 封装一次写操作请求
 type dbWriteReq struct {
-	fn     func() error   // 实际执行的写操作（在 writer goroutine 中调用）
-	result chan error      // 写操作完成后把 error 发回给调用方
+	fn     func() error // 实际执行的写操作（在 arbiter goroutine 中调用）
+	result chan error    // 写操作完成后把 error 发回给调用方（nil = fire-and-forget）
 }
 
-// dbWriteCh 是写操作的排队 channel，缓冲 512 防止短暂突发阻塞
-var dbWriteCh = make(chan dbWriteReq, 512)
+// dbArbiterCh 是所有 DB 写操作的统一入口，单 goroutine 串行消费
+// 缓冲 4096：insertCoalescer/doneCoalescer fire-and-forget，不会阻塞
+var dbArbiterCh = make(chan dbWriteReq, 4096)
 
-// startDBWriter 启动单一 writer goroutine，串行消费 dbWriteCh
+// ── INSERT Coalescer 类型定义 ─────────────────────────────────────────────
+type insertReq struct {
+	queue    string
+	payload  string
+	delaySec int64
+	priority int
+	dedupKey *string
+	resultCh chan insertResult
+}
+type insertResult struct {
+	id  int64
+	err error
+}
+
+var insertCoalesceCh = make(chan insertReq, 4096)
+
+// ── Done Coalescer 类型定义 ───────────────────────────────────────────────
+type doneReq struct {
+	id int64
+	ts int64
+}
+
+var doneCoalesceCh = make(chan doneReq, 4096)
+
+// startDBWriter 启动单一 writer goroutine，串行消费 dbArbiterCh
 // 必须在 initDB() 之后、其他 goroutine 启动之前调用
 func startDBWriter() {
 	go func() {
-		for req := range dbWriteCh {
-			req.result <- req.fn()
+		for req := range dbArbiterCh {
+			err := req.fn()
+			if req.result != nil {
+				req.result <- err
+			}
 		}
 	}()
-	log.Println("[DBWriter] Started — all writes serialized via channel")
+	log.Println("[DBArbiter] Started — all writes serialized via channel")
+}
+
+// startInsertCoalescer 启动 INSERT 合并器 goroutine
+// HTTP handler 把 insertReq 投入 insertCoalesceCh，coalescer 积累后批量 INSERT
+// 批量 INSERT 通过 dbArbiterCh fire-and-forget（result=nil），fn() 在 Arbiter 里执行并回写 resultCh
+func startInsertCoalescer() {
+	go func() {
+		ticker := time.NewTicker(500 * time.Microsecond)
+		defer ticker.Stop()
+		pending := make([]insertReq, 0, 64)
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			batch := pending
+			pending = make([]insertReq, 0, 64)
+			// fire-and-forget：result=nil，Arbiter 执行完 fn() 后不回写 result channel
+			// fn() 内部直接向每个 req.resultCh 发送 job_id，HTTP handler 等待 resultCh
+			dbArbiterCh <- dbWriteReq{
+				fn: func() error {
+					now := time.Now().Unix()
+					tx, err := db.Begin()
+					if err != nil {
+						for _, req := range batch {
+							req.resultCh <- insertResult{0, err}
+						}
+						return err
+					}
+					stmt, err := tx.Prepare(
+						`INSERT OR IGNORE INTO jobs (queue, payload, status, priority, dedup_key, available_at, created_at, updated_at)
+						VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`)
+					if err != nil {
+						tx.Rollback()
+						for _, req := range batch {
+							req.resultCh <- insertResult{0, err}
+						}
+						return err
+					}
+					defer stmt.Close()
+					for _, req := range batch {
+						res, err := stmt.Exec(req.queue, req.payload, req.priority, req.dedupKey,
+							now+req.delaySec, now, now)
+						if err != nil {
+							req.resultCh <- insertResult{0, err}
+							continue
+						}
+						id, _ := res.LastInsertId()
+						rows, _ := res.RowsAffected()
+						if rows == 0 {
+							id = 0 // dedup
+						}
+						req.resultCh <- insertResult{id, nil}
+					}
+					return tx.Commit()
+				},
+				result: nil, // fire-and-forget
+			}
+		}
+		for {
+			select {
+			case req := <-insertCoalesceCh:
+				pending = append(pending, req)
+				if len(pending) >= 50 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			case <-stopGoWorker:
+				flush()
+				return
+			}
+		}
+	}()
+	log.Println("[InsertCoalescer] Started — batch INSERT every 500μs or 50 reqs")
+}
+
+// startDoneCoalescer 启动 markDone 合并器 goroutine
+// WS handler 把 doneReq 投入 doneCoalesceCh，coalescer 积累后批量 UPDATE
+// 批量 UPDATE 通过 dbArbiterCh fire-and-forget（result=nil）
+func startDoneCoalescer() {
+	go func() {
+		ticker := time.NewTicker(1 * time.Millisecond)
+		defer ticker.Stop()
+		pending := make([]doneReq, 0, 64)
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			batch := pending
+			pending = make([]doneReq, 0, 64)
+			dbArbiterCh <- dbWriteReq{
+				fn: func() error {
+					tx, err := db.Begin()
+					if err != nil {
+						return err
+					}
+					stmt, err := tx.Prepare(
+						`UPDATE jobs SET status='done', finished_at=?, updated_at=? WHERE id=?`)
+					if err != nil {
+						tx.Rollback()
+						return err
+					}
+					defer stmt.Close()
+					for _, req := range batch {
+						stmt.Exec(req.ts, req.ts, req.id) //nolint
+					}
+					return tx.Commit()
+				},
+				result: nil, // fire-and-forget
+			}
+			broadcastStats()
+		}
+		for {
+			select {
+			case req := <-doneCoalesceCh:
+				pending = append(pending, req)
+				if len(pending) >= 50 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			case <-stopGoWorker:
+				flush()
+				return
+			}
+		}
+	}()
+	log.Println("[DoneCoalescer] Started — batch markDone every 1ms or 50 reqs")
 }
 
 // dbExec 通过写 channel 执行单条写 SQL，等待结果返回
 // 用于替代直接调用 db.Exec(...)
 func dbExec(query string, args ...interface{}) error {
 	result := make(chan error, 1)
-	dbWriteCh <- dbWriteReq{
+	dbArbiterCh <- dbWriteReq{
 		fn: func() error {
 			_, err := db.Exec(query, args...)
 			return err
@@ -73,7 +229,7 @@ func dbExecResult(query string, args ...interface{}) (sql.Result, error) {
 	}
 	resultCh := make(chan resultPair, 1)
 	result := make(chan error, 1)
-	dbWriteCh <- dbWriteReq{
+	dbArbiterCh <- dbWriteReq{
 		fn: func() error {
 			res, err := db.Exec(query, args...)
 			resultCh <- resultPair{res, err}
@@ -89,7 +245,7 @@ func dbExecResult(query string, args ...interface{}) (sql.Result, error) {
 // fn 在 writer goroutine 中串行执行，保证事务原子性且无锁竞争
 func dbTxFunc(fn func(*sql.Tx) error) error {
 	result := make(chan error, 1)
-	dbWriteCh <- dbWriteReq{
+	dbArbiterCh <- dbWriteReq{
 		fn: func() error {
 			tx, err := db.Begin()
 			if err != nil {
@@ -138,7 +294,7 @@ func initDB() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	// 写操作通过 dbWriteCh 单 goroutine 串行执行，读操作可并发
+	// 写操作通过 dbArbiterCh 单 goroutine 串行执行，读操作可并发
 	// 设置 MaxOpenConns=4：1个写连接 + 多个读连接，充分利用 WAL 并发读
 	db.SetMaxOpenConns(4)
 	db.SetMaxIdleConns(4)
@@ -235,35 +391,30 @@ type DispatchOptions struct {
 
 // dispatchJobRaw 直接用已序列化的 payload 字符串投递任务（handleDispatch 使用）
 func dispatchJobRaw(queue string, rawPayload string, delaySeconds int64, opts ...DispatchOptions) (int64, error) {
-	now := time.Now().Unix()
 	prio := 5
 	var dedupKey *string
 	if len(opts) > 0 {
-	if opts[0].Priority >= 1 && opts[0].Priority <= 10 {
-	prio = opts[0].Priority
+		if opts[0].Priority >= 1 && opts[0].Priority <= 10 {
+			prio = opts[0].Priority
+		}
+		if opts[0].DedupKey != "" {
+			dedupKey = &opts[0].DedupKey
+		}
 	}
-	if opts[0].DedupKey != "" {
-	dedupKey = &opts[0].DedupKey
+	resultCh := make(chan insertResult, 1)
+	insertCoalesceCh <- insertReq{
+		queue:    queue,
+		payload:  rawPayload,
+		delaySec: delaySeconds,
+		priority: prio,
+		dedupKey: dedupKey,
+		resultCh: resultCh,
 	}
-	}
-	res, err := dbExecResult(
-	`INSERT OR IGNORE INTO jobs (queue, payload, status, priority, dedup_key, available_at, created_at, updated_at)
-	VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)`,
-	queue, rawPayload, prio, dedupKey, now+delaySeconds, now, now,
-	)
-	if err != nil {
-	return 0, err
-	}
-	id, _ := res.LastInsertId()
-	rows, _ := res.RowsAffected()
-	if rows == 0 {
-	return 0, nil
-	}
-	return id, nil
+	r := <-resultCh
+	return r.id, r.err
 }
 
 
-// dispatchJob 构造 payload 并投递任务（内部 Go 代码使用，支持 timeout_sec / max_attempts）
 func dispatchJob(queue string, jobType string, data interface{}, delaySeconds int64, opts ...DispatchOptions) (int64, error) {
 	dataBytes, _ := json.Marshal(data)
 	type fullPayload struct {
@@ -321,7 +472,7 @@ func reserveBatch(queue string, n int) ([]*Job, error) {
 	resultCh := make(chan result, 1)
 
 	// 把 SELECT + UPDATE 全部放入 writer goroutine，原子执行，消除并发写冲突
-	dbWriteCh <- dbWriteReq{
+	dbArbiterCh <- dbWriteReq{
 		fn: func() error {
 			now := time.Now().Unix()
 			rows, err := db.Query(
@@ -421,16 +572,13 @@ func initTimeouts() {
 var workerWg sync.WaitGroup
 
 func markDone(id int64) {
-	go func() {
-		now := time.Now().Unix()
-		dbExec(`UPDATE jobs SET status='done', finished_at=?, updated_at=? WHERE id=?`, now, now, id) //nolint
-		broadcastStats()
-	}()
+	doneCoalesceCh <- doneReq{id: id, ts: time.Now().Unix()}
 }
 
 // handleJobFailure：失败时先判断是否还有重试机会
 //   - attempts < MaxAttempts → 放回 pending，指数退避延迟
 //   - attempts >= MaxAttempts → 进死信队列（failed_jobs）
+
 func handleJobFailure(j *Job, reason string) {
 	now := time.Now().Unix()
 
@@ -1506,6 +1654,8 @@ func main() {
 	initLogger()
 	initDB()
 	startDBWriter() // 启动单一 writer goroutine，所有写操作通过 channel 串行化
+	startInsertCoalescer() // 启动 INSERT 合并器，批量写入提升吞吐
+	startDoneCoalescer()   // 启动 markDone 合并器，批量 UPDATE 减少写次数
 	initBatchDB()
 	initCronDB()
 	startCronScheduler()
