@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"flag"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,6 +25,7 @@ import (
 // ─────────────────────────────────────────────
 
 var db *sql.DB
+var dbPath = "/tmp/queue.db" // DB 文件路径，可通过 -db 命令行参数覆盖
 
 // vacuumState 记录空闲压缩的运行状态，暴露到 /api/stats
 var vacuumState = struct {
@@ -316,7 +318,7 @@ func (slogWriter) Write(p []byte) (n int, err error) {
 
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite", "/tmp/queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(200)")
+	db, err = sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(200)")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1292,7 +1294,7 @@ func isSystemIdle() bool {
 
 // dbFilePath 返回当前 DB 文件路径
 func dbFilePath() string {
-	return "/tmp/queue.db"
+	return dbPath
 }
 
 // dbFileSize 返回 DB 的逻辑大小（page_count × page_size，字节）。
@@ -1888,6 +1890,14 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		"db_size_now":      dbFileSize(),
 	}
 
+	// 运行路径信息
+	if exePath, err2 := os.Executable(); err2 == nil {
+		stats["exe_path"] = exePath
+	} else {
+		stats["exe_path"] = "(unknown)"
+	}
+	stats["db_path"] = dbPath
+
 	jsonResp(w, 200, stats)
 }
 
@@ -2100,6 +2110,11 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 // ─────────────────────────────────────────────
 
 func main() {
+	// 命令行参数解析（必须在所有 init 之前）
+	dbFlag := flag.String("db", "/tmp/queue.db", "SQLite DB 文件路径（默认: /tmp/queue.db）")
+	flag.Parse()
+	dbPath = *dbFlag
+
 	initTimeouts()
 	initLogger()
 	initDB()

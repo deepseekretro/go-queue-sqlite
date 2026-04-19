@@ -617,6 +617,21 @@ const indexHTML = `<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Runtime Paths -->
+    <div style="margin-top:16px;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;">
+      <div style="font-size:.85rem;font-weight:600;color:#e2e8f0;margin-bottom:12px;">&#128193; Runtime Paths</div>
+      <table style="width:100%;border-collapse:collapse;font-size:.8rem;">
+        <tr>
+          <td style="color:#64748b;padding:5px 10px 5px 0;white-space:nowrap;width:90px;">EXE PATH</td>
+          <td id="sys-exe-path" style="color:#a5f3fc;font-family:monospace;word-break:break-all;">—</td>
+        </tr>
+        <tr>
+          <td style="color:#64748b;padding:5px 10px 5px 0;white-space:nowrap;">DB PATH</td>
+          <td id="sys-db-path" style="color:#86efac;font-family:monospace;word-break:break-all;">—</td>
+        </tr>
+      </table>
+    </div>
+
     <!-- Queue Pending Distribution -->
     <div style="margin-top:16px;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;">
       <div style="font-size:.85rem;font-weight:600;color:#e2e8f0;margin-bottom:12px;">&#128202; Queue Pending Distribution</div>
@@ -1165,6 +1180,10 @@ async function loadSystem() {
       if (avgEl) avgEl.textContent = s.avg_duration_ms ? s.avg_duration_ms + ' ms' : '—';
       const dlqEl = document.getElementById('sys-failed-dlq');
       if (dlqEl) dlqEl.textContent = s.failed_jobs_table ?? '—';
+      const exeEl = document.getElementById('sys-exe-path');
+      if (exeEl) exeEl.textContent = s.exe_path || '—';
+      const dbPathEl = document.getElementById('sys-db-path');
+      if (dbPathEl) dbPathEl.textContent = s.db_path || '—';
       const verEl = document.getElementById('sys-version');
       if (verEl) verEl.textContent = s.version || '—';
 
