@@ -2112,6 +2112,7 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// 命令行参数解析（必须在所有 init 之前）
 	dbFlag := flag.String("db", "/tmp/queue.db", "SQLite DB 文件路径（默认: /tmp/queue.db）")
+	cacheBackendFlag := flag.String("cache-backend", "memory", "缓存后端: memory（默认）或 file")
 	flag.Parse()
 	dbPath = *dbFlag
 
@@ -2125,6 +2126,7 @@ func main() {
 	initCronDB()
 	startCronScheduler()
 	initTagsDB()
+	initCacheDB(dbPath, *cacheBackendFlag)
 
 	startStaleJobReaper()
 	startHeartbeatReaper()
@@ -2217,6 +2219,8 @@ func main() {
 	mux.HandleFunc("/api/admin/vacuum", cors(auth(handleAdminVacuum))) // 手动触发 VACUUM
 	mux.HandleFunc("/api/db/reset", cors(auth(handleDBReset)))
 	mux.HandleFunc("/api/me", requireLogin(handleMe))
+	mux.HandleFunc("/api/cache/", cors(auth(cacheRouter)))
+	mux.HandleFunc("/api/cache-stats", cors(auth(cacheRouter)))
 	mux.HandleFunc("/api/events", requireLogin(handleSSE))
 	mux.HandleFunc("/api/jobs/failed", cors(auth(handleClearFailed)))
 	mux.HandleFunc("/api/jobs/retry-failed", cors(auth(handleRetryFailed)))
