@@ -118,6 +118,7 @@ const indexHTML = `<!DOCTYPE html>
   <div style="margin-left:auto;display:flex;align-items:center;gap:12px;">
     <span class="dot dot-running"></span>
     <span style="font-size:.8rem;color:#34d399">Server Active</span>
+    <a href="/examples/ws_worker_demo/" style="font-size:.8rem;padding:5px 12px;background:#1e293b;border:1px solid #334155;color:#a78bfa;border-radius:6px;text-decoration:none;" target="_blank">⚡ WS Worker Demo</a>
     <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;" onclick="loadAll()">↻ Refresh</button>
     <button class="btn btn-sm" style="background:#450a0a;border:1px solid #7f1d1d;color:#fca5a5;" onclick="confirmDBReset()">🗑 重置数据库</button>
     <div style="display:flex;align-items:center;gap:8px;margin-left:8px;padding-left:12px;border-left:1px solid #334155;">

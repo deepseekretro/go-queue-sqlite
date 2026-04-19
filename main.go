@@ -1941,6 +1941,7 @@ func main() {
 	})
 	mux.HandleFunc("/logout", handleLogout)
 	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/examples/", handleExamples)
 	mux.HandleFunc("/metrics", handleMetrics)
 	mux.HandleFunc("/ws/worker", handleWorkerWS)
 	mux.HandleFunc("/api/jobs", cors(auth(func(w http.ResponseWriter, r *http.Request) {
