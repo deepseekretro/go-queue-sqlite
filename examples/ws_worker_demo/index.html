@@ -105,24 +105,25 @@
   .tab-bar { display: flex; gap: 4px; margin-bottom: 14px; }
   .tab { padding: 6px 14px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #64748b; cursor: pointer; font-size: 0.8rem; }
   .tab.active { background: #1e3a5f; color: #60a5fa; border-color: #3b82f6; }
-</style>
-/* 额外补充 ws-panel 相关样式（从 Dashboard 迁移） */
-.ws-panel { }
-.worker-config { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
-.worker-config > div { display: flex; flex-direction: column; gap: 4px; }
-.ws-status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: .85rem; }
-.ws-dot { width: 10px; height: 10px; border-radius: 50%; background: #475569; flex-shrink: 0; }
-.ws-dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
-.ws-dot.error { background: #ef4444; }
-.ws-label { color: #94a3b8; }
-.log-box { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; height: 260px; overflow-y: auto; font-family: monospace; font-size: .78rem; line-height: 1.6; }
-.log-info { color: #64748b; }
-.log-recv { color: #34d399; }
-.log-send { color: #60a5fa; }
-.log-err  { color: #f87171; }
-.log-done { color: #86efac; }
-.log-time { color: #475569; margin-right: 6px; }
-.code-block { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 16px; font-family: monospace; font-size: .78rem; line-height: 1.7; white-space: pre; overflow-x: auto; max-height: 400px; overflow-y: auto; color: #e2e8f0; }
+
+  /* ws-panel 相关样式 */
+  .worker-config { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
+  .worker-config > div { display: flex; flex-direction: column; gap: 4px; }
+  .ws-status { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font-size: .85rem; }
+  .ws-dot { width: 10px; height: 10px; border-radius: 50%; background: #475569; flex-shrink: 0; }
+  .ws-dot.connected { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+  .ws-dot.error { background: #ef4444; }
+  .ws-label { color: #94a3b8; }
+  .log-box { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; height: 260px; overflow-y: auto; font-family: monospace; font-size: .78rem; line-height: 1.6; }
+  .log-info { color: #64748b; }
+  .log-recv { color: #34d399; }
+  .log-send { color: #60a5fa; }
+  .log-err  { color: #f87171; }
+  .log-done { color: #86efac; }
+  .log-ok   { color: #86efac; }
+  .log-warn { color: #fbbf24; }
+  .log-ts   { color: #475569; margin-right: 6px; }
+  .code-block { background: #0f172a; border: 1px solid #1e293b; border-radius: 8px; padding: 16px; font-family: monospace; font-size: .78rem; line-height: 1.7; white-space: pre; overflow-x: auto; max-height: 400px; overflow-y: auto; color: #e2e8f0; }
 </style>
 </head>
 <body>
@@ -248,9 +249,6 @@
 
 </div>
 <script>
-// ─── WebSocket URL ────────────────────────────────────────────────────────────
-const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/worker';
-
 // ─── WebSocket URL ────────────────────────────────────────────────────────────
 const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/worker';
 
