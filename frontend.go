@@ -133,6 +133,15 @@ const indexHTML = `<!DOCTYPE html>
     outline: none; border-color: #6366f1 !important;
     box-shadow: 0 0 0 2px rgba(99,102,241,.2);
   }
+
+  /* ── Nav Tabs ─────────────────────────────────────────────────────────────── */
+  .nav-tab {
+    background: #1e293b; border: 1px solid #334155; color: #94a3b8;
+    padding: 6px 14px; border-radius: 6px; font-size: .78rem; cursor: pointer;
+    transition: all .15s;
+  }
+  .nav-tab:hover { border-color: #6366f1; color: #a5b4fc; }
+  .nav-tab.active { background: #312e81; border-color: #6366f1; color: #c7d2fe; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -156,18 +165,32 @@ const indexHTML = `<!DOCTYPE html>
 
 <div class="container">
 
+  <!-- Nav Tabs -->
+  <div id="nav-tabs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;padding:12px 0 0;border-bottom:1px solid #1e293b;">
+    <button class="nav-tab active" onclick="scrollToPanel('stats')">📊 Stats</button>
+    <button class="nav-tab" onclick="scrollToPanel('workers-panel')">🖥 Workers</button>
+    <button class="nav-tab" onclick="scrollToPanel('queue-actions-panel')">🔧 Queues</button>
+    <button class="nav-tab" onclick="scrollToPanel('jobs-panel')">📋 Jobs</button>
+    <button class="nav-tab" onclick="scrollToPanel('crons-panel')">⏰ Crons</button>
+    <button class="nav-tab" onclick="scrollToPanel('batches-panel')">📦 Batches</button>
+    <button class="nav-tab" onclick="scrollToPanel('rate-limits-panel')">⚡ Rate Limits</button>
+    <button class="nav-tab" onclick="scrollToPanel('autoscale-panel')">🔄 AutoScale</button>
+    <button class="nav-tab" onclick="scrollToPanel('system-panel')">🗄 System</button>
+  </div>
+
   <!-- Stats -->
   <div class="stats" id="stats">
     <div class="stat-card"><div class="num num-pending" id="s-pending">-</div><div class="lbl">Pending</div></div>
     <div class="stat-card"><div class="num num-running" id="s-running">-</div><div class="lbl">Running</div></div>
     <div class="stat-card"><div class="num num-done"    id="s-done">-</div><div class="lbl">Done</div></div>
     <div class="stat-card"><div class="num num-failed"  id="s-failed">-</div><div class="lbl">Failed</div></div>
+    <div class="stat-card"><div class="num" style="color:#94a3b8" id="s-cancelled">-</div><div class="lbl">Cancelled</div></div>
     <div class="stat-card"><div class="num" style="color:#a78bfa" id="s-total">-</div><div class="lbl">Total Jobs</div></div>
     <div class="stat-card"><div class="num num-ws" id="s-ws">-</div><div class="lbl">WS Workers</div></div>
   </div>
 
   <!-- Workers Panel -->
-  <div class="panel workers-panel">
+  <div class="panel workers-panel" id="workers-panel">
     <h2>🖥 Connected Workers</h2>
     <div class="table-wrap">
       <table id="workers-table">
@@ -177,11 +200,12 @@ const indexHTML = `<!DOCTYPE html>
             <th>Queue</th>
             <th>Status</th>
             <th>Current Job</th>
+            <th>Last Heartbeat</th>
             <th>Action</th>
           </tr>
         </thead>
         <tbody id="workers-tbody">
-          <tr><td colspan="5" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
+          <tr><td colspan="6" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
         </tbody>
       </table>
     </div>
@@ -201,7 +225,7 @@ const indexHTML = `<!DOCTYPE html>
   </div>
 
   <!-- Jobs list -->
-  <div class="panel">
+  <div class="panel" id="jobs-panel">
     <h2>📋 Jobs</h2>
     <div class="filter-bar">
       <div>
@@ -605,12 +629,13 @@ function toast(msg, type='ok') {
 async function loadStats() {
   const res = await fetch('/api/stats');
   const s = await res.json();
-  document.getElementById('s-pending').textContent = s.pending || 0;
-  document.getElementById('s-running').textContent = s.running || 0;
-  document.getElementById('s-done').textContent    = s.done    || 0;
-  document.getElementById('s-failed').textContent  = s.failed  || 0;
-  document.getElementById('s-ws').textContent      = s.ws_workers || 0;
-  const total = (s.pending||0)+(s.running||0)+(s.done||0)+(s.failed||0);
+  document.getElementById('s-pending').textContent   = s.pending   || 0;
+  document.getElementById('s-running').textContent   = s.running   || 0;
+  document.getElementById('s-done').textContent      = s.done      || 0;
+  document.getElementById('s-failed').textContent    = s.failed    || 0;
+  document.getElementById('s-cancelled').textContent = s.cancelled || 0;
+  document.getElementById('s-ws').textContent        = s.ws_workers || 0;
+  const total = (s.pending||0)+(s.running||0)+(s.done||0)+(s.failed||0)+(s.cancelled||0);
   document.getElementById('s-total').textContent = total;
   loadWorkers();
 }
@@ -621,7 +646,7 @@ async function loadWorkers() {
   const workers = await res.json();
   const tbody = document.getElementById('workers-tbody');
   if (!workers || workers.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:24px">No workers connected</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:24px">No workers connected</td></tr>';
     return;
   }
   tbody.innerHTML = workers.map(function(w) {
@@ -634,15 +659,23 @@ async function loadWorkers() {
       : '<span style="color:#475569">&mdash;</span>';
     var shortId = w.id.length > 20 ? '\u2026' + w.id.slice(-16) : w.id;
     var rowClass = isIdle ? 'worker-row-idle' : 'worker-row-busy';
+    var hb = w.heartbeat || {};
+    var hbCell = hb.last_seen_sec !== undefined
+      ? (hb.alive
+          ? '<span style="color:#34d399;font-size:.75rem;">&#9679; ' + hb.last_seen_sec + 's ago</span>'
+          : '<span style="color:#f87171;font-size:.75rem;">&#9679; ' + hb.last_seen_sec + 's ago (stale)</span>')
+      : '<span style="color:#475569">&mdash;</span>';
     return '<tr class="' + rowClass + '">'
       + '<td style="font-family:monospace;font-size:0.75rem" title="' + escHtml(w.id) + '">' + escHtml(shortId) + '</td>'
       + '<td><span style="color:#a78bfa">' + escHtml(w.queue) + '</span></td>'
       + '<td>' + statusBadge + '</td>'
       + '<td>' + currentJob + '</td>'
+      + '<td>' + hbCell + '</td>'
       + '<td><button class="btn-kick" onclick="kickWorker(\'' + escHtml(w.id) + '\', this)">&#9889; Kick</button></td>'
       + '</tr>';
   }).join('');
 }
+
 
 async function kickWorker(workerId, btn) {
   if (!confirm('确定要踢掉 Worker ' + workerId + ' 吗？\n当前任务将被放回队列重新处理。')) return;
@@ -718,7 +751,7 @@ async function loadJobs() {
       const tagsHtml = j.tags && j.tags.length
         ? j.tags.map(t => ` + "`" + `<span style="background:#1e3a5f;color:#93c5fd;padding:1px 6px;border-radius:4px;font-size:.72rem;cursor:pointer" onclick="document.getElementById('f-tag').value='${escHtml(t)}';jobsGoPage(1)">${escHtml(t)}</span>` + "`" + `).join('')
         : '<span style="color:#475569">&mdash;</span>';
-      return ` + "`" + `<tr>
+      return ` + "`" + `<tr style="cursor:pointer;" onclick="toggleJobDetail(${j.id}, this)" title="Click to expand">
       <td style="color:#a78bfa;font-weight:600">#${j.id}</td>
       <td><code style="color:#fbbf24">${j.queue}</code></td>
       <td><code style="color:#93c5fd">${jt}</code></td>
@@ -728,10 +761,31 @@ async function loadJobs() {
       <td class="payload-cell" title="${j.payload.replace(/"/g,'&quot;')}">${payloadShort}</td>
       <td class="ts">${fmtTime(j.created_at)}</td>
       <td class="ts">${fmtTime(j.updated_at)}</td>
-      <td style="white-space:nowrap;">
+      <td style="white-space:nowrap;" onclick="event.stopPropagation()">
         ${j.status === 'pending' || j.status === 'running'
           ? ` + "`" + `<button onclick="cancelJob(${j.id},this)" style="background:#2d1515;border:1px solid #7f1d1d;color:#f87171;padding:3px 9px;border-radius:5px;font-size:.75rem;cursor:pointer;" title="Cancel job">&#10005; Cancel</button>` + "`" + `
           : ` + "`" + `<span style="color:#475569;font-size:.75rem;">—</span>` + "`" + `}
+      </td>
+    </tr>
+    <tr id="job-detail-${j.id}" style="display:none;background:#0a1628;">
+      <td colspan="10" style="padding:0;">
+        <div style="padding:12px 20px;border-top:1px solid #1e3a5f;border-bottom:1px solid #1e3a5f;">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+            <div>
+              <div style="font-size:.72rem;color:#64748b;margin-bottom:6px;letter-spacing:.05em;">PAYLOAD</div>
+              <pre style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:10px;font-size:.75rem;color:#a5f3fc;overflow-x:auto;max-height:200px;white-space:pre-wrap;word-break:break-all;">${(() => { try { return JSON.stringify(JSON.parse(j.payload), null, 2); } catch(e) { return escHtml(j.payload); } })()}</pre>
+            </div>
+            <div style="font-size:.78rem;line-height:2;color:#64748b;">
+              <div>ID: <span style="color:#e2e8f0;">${j.id}</span></div>
+              <div>Queue: <span style="color:#fbbf24;">${escHtml(j.queue)}</span></div>
+              <div>Status: ${statusBadge(j.status)}</div>
+              <div>Attempts: <span style="color:#e2e8f0;">${j.attempts}</span></div>
+              <div>Available At: <span style="color:#94a3b8;">${fmtTime(j.available_at)}</span></div>
+              <div>Started At: <span style="color:#94a3b8;">${j.started_at ? fmtTime(j.started_at) : '—'}</span></div>
+              <div>Finished At: <span style="color:#94a3b8;">${j.finished_at ? fmtTime(j.finished_at) : '—'}</span></div>
+            </div>
+          </div>
+        </div>
       </td>
     </tr>` + "`" + `;
     }).join('');
@@ -1516,6 +1570,36 @@ async function cancelJob(id, btn) {
     btn.disabled = false;
     btn.innerHTML = '&#10005; Cancel';
   }
+}
+
+
+// ─── Job Detail Expand ────────────────────────────────────────────────────────
+
+function toggleJobDetail(id, row) {
+  const detailRow = document.getElementById('job-detail-' + id);
+  if (!detailRow) return;
+  const isOpen = detailRow.style.display !== 'none';
+  detailRow.style.display = isOpen ? 'none' : 'table-row';
+  row.style.background = isOpen ? '' : 'rgba(99,102,241,0.06)';
+}
+
+// ─── Nav Tab Scroll ───────────────────────────────────────────────────────────
+
+function scrollToPanel(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.scrollIntoView({behavior: 'smooth', block: 'start'});
+  // 高亮激活的 tab
+  document.querySelectorAll('.nav-tab').forEach(function(btn) {
+    btn.classList.remove('active');
+  });
+  // 找对应的 tab 按钮
+  const tabs = document.querySelectorAll('.nav-tab');
+  tabs.forEach(function(btn) {
+    if (btn.getAttribute('onclick') && btn.getAttribute('onclick').includes("'" + id + "'")) {
+      btn.classList.add('active');
+    }
+  });
 }
 
 async function loadQueuesForFilter() {
