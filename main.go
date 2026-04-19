@@ -198,11 +198,15 @@ func startDoneCoalescer() {
 					for _, req := range batch {
 						stmt.Exec(req.ts, req.ts, req.id) //nolint
 					}
-					return tx.Commit()
+					err2 := tx.Commit()
+					if err2 == nil {
+						// Bug C 修复：在 UPDATE 提交后再广播统计，确保 stats 反映最新状态
+						broadcastStats()
+					}
+					return err2
 				},
 				result: nil, // fire-and-forget
 			}
-			broadcastStats()
 		}
 		for {
 			select {
@@ -705,6 +709,7 @@ type WsWorker struct {
 	done         chan struct{}
 	kick         chan struct{} // 收到信号后主动断开连接（被踢）
 	currentJobID int64        // 当前正在处理的任务 ID，断连时用于放回 pending
+	currentJob   *Job         // 缓存当前正在处理的 job 对象（含最新 attempts，供 markFailed 使用）
 	idle         bool         // true = 空闲，可接受新任务
 	timeoutSec   int          // 当前任务的超时秒数（0 = 使用 WsJobTimeoutSec 全局默认）
 	connectedAt  int64        // worker 连接时的 Unix 时间戳（秒）
@@ -917,6 +922,7 @@ func (h *WorkerHub) dispatchToWs(j *Job) bool {
 		case w.send <- b:
 			w.idle = false          // 标记为忙碌
 			w.currentJobID = j.ID   // 记录当前任务
+			w.currentJob = j        // 缓存 job 对象（attempts 已+1），供 markFailed 使用
 			w.timeoutSec = jobTimeoutSec // 记录超时，供 WS handler 使用
 			h.rrIdx = (idx + 1) % n // 下次从下一个开始
 			return true
@@ -1183,6 +1189,7 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 				hub.mu.Lock()
 				worker.idle = true
 				worker.currentJobID = 0
+				worker.currentJob = nil // 清空缓存的 job 对象
 				worker.timeoutSec = 0
 				worker.jobsDone++
 				hub.mu.Unlock()
@@ -1201,10 +1208,21 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 					ack, _ := json.Marshal(WsControl{Type: "ack", Message: fmt.Sprintf("job #%d done", result.JobID)})
 					conn.WriteMessage(1, ack)
 				} else {
-					row := db.QueryRow(`SELECT id,queue,payload,attempts,status,priority,available_at,started_at,finished_at,created_at,updated_at FROM jobs WHERE id=?`, result.JobID)
-					var j Job
-					row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority, &j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt)
-					markFailed(&j, result.Error)
+					// Bug A 修复：直接用 dispatcher 缓存的 job 对象，避免从 DB 读到旧的 attempts
+					// reserveBatch 已经把 attempts+1 写入 DB（通过 dbArbiter），
+					// 但 db.QueryRow 可能在 UPDATE 完成前读到旧值，导致重试次数判断错误
+					hub.mu.Lock()
+					cachedJob := worker.currentJob
+					hub.mu.Unlock()
+					if cachedJob != nil {
+						markFailed(cachedJob, result.Error)
+					} else {
+						// fallback：从 DB 读（兜底，正常不会走到这里）
+						row := db.QueryRow(`SELECT id,queue,payload,attempts,status,priority,available_at,started_at,finished_at,created_at,updated_at FROM jobs WHERE id=?`, result.JobID)
+						var j Job
+						row.Scan(&j.ID, &j.Queue, &j.Payload, &j.Attempts, &j.Status, &j.Priority, &j.AvailableAt, &j.StartedAt, &j.FinishedAt, &j.CreatedAt, &j.UpdatedAt)
+						markFailed(&j, result.Error)
+					}
 					log.Printf("[WS] Job #%d failed by worker %s: %s", result.JobID, workerID, result.Error)
 				}
 			case <-worker.kick:

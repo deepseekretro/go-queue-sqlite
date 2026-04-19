@@ -217,12 +217,13 @@ const indexHTML = `<!DOCTYPE html>
             <th>Queue</th>
             <th>Status</th>
             <th>Current Job</th>
+            <th>Connected</th>
             <th>Last Heartbeat</th>
             <th>Action</th>
           </tr>
         </thead>
         <tbody id="workers-tbody">
-          <tr><td colspan="6" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
+          <tr><td colspan="7" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
         </tbody>
       </table>
     </div>
@@ -663,9 +664,11 @@ async function loadWorkers() {
   const workers = await res.json();
   const tbody = document.getElementById('workers-tbody');
   if (!workers || workers.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:24px">No workers connected</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#64748b;padding:24px">No workers connected</td></tr>';
     return;
   }
+  // 按 connected_at 降序排序：最新连接的排在最上面，保持稳定顺序避免刷新时行跳动
+  workers.sort(function(a, b) { return (b.connected_at || 0) - (a.connected_at || 0); });
   tbody.innerHTML = workers.map(function(w) {
     var isIdle = w.idle;
     var statusBadge = isIdle
@@ -676,17 +679,29 @@ async function loadWorkers() {
       : '<span style="color:#475569">&mdash;</span>';
     var shortId = w.id.length > 20 ? '\u2026' + w.id.slice(-16) : w.id;
     var rowClass = isIdle ? 'worker-row-idle' : 'worker-row-busy';
+    // Connected 列：显示连接时刻（时:分:秒）+ 已连接时长
+    var connCell = '<span style="color:#475569">&mdash;</span>';
+    if (w.connected_at) {
+      var connTime = new Date(w.connected_at * 1000).toLocaleTimeString('zh-CN', {hour12: false});
+      var uptime = w.uptime_sec || 0;
+      var uptimeStr = uptime < 60 ? uptime + 's'
+        : uptime < 3600 ? Math.floor(uptime/60) + 'm' + (uptime%60) + 's'
+        : Math.floor(uptime/3600) + 'h' + Math.floor((uptime%3600)/60) + 'm';
+      connCell = '<span style="font-size:.75rem;color:#94a3b8" title="' + connTime + '">'
+        + connTime + ' <span style="color:#475569">(' + uptimeStr + ')</span></span>';
+    }
     var hb = w.heartbeat || {};
     var hbCell = hb.last_seen_sec !== undefined
       ? (hb.alive
-          ? '<span style="color:#34d399;font-size:.75rem;">&#9679; ' + hb.last_seen_sec + 's ago</span>'
-          : '<span style="color:#f87171;font-size:.75rem;">&#9679; ' + hb.last_seen_sec + 's ago (stale)</span>')
+        ? '<span style="color:#34d399;font-size:.75rem;">&#9679; ' + hb.last_seen_sec + 's ago</span>'
+        : '<span style="color:#f87171;font-size:.75rem;">&#9679; ' + hb.last_seen_sec + 's ago (stale)</span>')
       : '<span style="color:#475569">&mdash;</span>';
     return '<tr class="' + rowClass + '">'
       + '<td style="font-family:monospace;font-size:0.75rem" title="' + escHtml(w.id) + '">' + escHtml(shortId) + '</td>'
       + '<td><span style="color:#a78bfa">' + escHtml(w.queue) + '</span></td>'
       + '<td>' + statusBadge + '</td>'
       + '<td>' + currentJob + '</td>'
+      + '<td>' + connCell + '</td>'
       + '<td>' + hbCell + '</td>'
       + '<td><button class="btn-kick" onclick="kickWorker(\'' + escHtml(w.id) + '\', this)">&#9889; Kick</button></td>'
       + '</tr>';
