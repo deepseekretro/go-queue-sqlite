@@ -33,6 +33,13 @@
      - [立即触发 API](#立即触发-api)
      - [触发历史 API](#触发历史-api)
 8. [Dashboard 说明](#8-dashboard-说明)
+9. [Cache 服务](#9-cache-服务)
+   - 9.1 [架构与后端选择](#91-架构与后端选择)
+   - 9.2 [REST API 参考](#92-rest-api-参考)
+   - 9.3 [使用示例](#93-使用示例)
+   - 9.4 [过期清理机制](#94-过期清理机制)
+   - 9.5 [性能参考（memory vs file）](#95-性能参考memory-vs-file)
+   - 9.6 [Cache Dashboard](#96-cache-dashboard)
 
 ---
 
@@ -1745,4 +1752,288 @@ Dashboard 提供以下功能：
 
 ---
 
-*文档更新时间：2026-04-18（P3-B Cron 增强版：expr/timezone/without_overlapping/one_time/max_runs/expires_at/trigger/logs）*
+*文档更新时间：2026-04-19（新增 Cache 服务文档：9.1~9.6）*
+
+---
+
+## 9. Cache 服务
+
+go-queue-sqlite 内置了一个轻量级 **HTTP Cache 服务**，基于 SQLite 实现，支持 TTL 自动过期、内存/文件两种后端，可作为应用层缓存使用，无需额外部署 Redis 等外部依赖。
+
+---
+
+### 9.1 架构与后端选择
+
+Cache 服务使用**独立的 SQLite 数据库连接**，与队列服务（`queue.db`）完全隔离，互不影响。
+
+```
+goapp 进程
+├── db（*sql.DB）       → queue.db   队列任务存储
+└── cacheDB（*sql.DB）  → cache.db 或 :memory:   缓存存储
+```
+
+启动时通过 `-cache-backend` 参数选择后端：
+
+| 参数值 | 存储位置 | 重启后数据 | 适用场景 |
+|---|---|---|---|
+| `memory`（默认） | SQLite `:memory:`（进程内） | 丢失 | 低延迟、数据量可控、无需持久化 |
+| `file` | 与 `queue.db` 同目录的 `cache.db` | 保留 | 大数据量、需持久化、内存敏感 |
+
+```bash
+# 使用内存模式（默认）
+./goapp
+
+# 使用文件模式（重启不丢失，内存占用低）
+./goapp -cache-backend=file
+```
+
+**启动时内存检测：** 程序启动时会自动检测本机总内存，若内存不足 1GB 且使用 `memory` 模式，会在日志中输出 ⚠️ 警告，建议切换到 `file` 模式：
+
+```
+[Cache] 内存检测：本机总内存 = 512.00 MB，cache-backend = memory
+[Cache] ⚠️  警告：本机内存不足 1GB（512.00 MB），建议使用 file 模式以避免内存压力。
+         启动参数加上 -cache-backend=file 即可切换。
+```
+
+---
+
+### 9.2 REST API 参考
+
+所有 Cache API 均支持 CORS，无需鉴权。
+
+---
+
+#### POST /api/cache/:key — 写入缓存
+
+**请求体（JSON）：**
+
+```json
+{
+  "data": { "user": "alice", "score": 99 },  // 任意 JSON 值（对象、数组、字符串、数字均可）
+  "ttl": 3600                                  // 过期时间（秒），0 = 默认 3600 秒，-1 = 永不过期
+}
+```
+
+**响应（200）：**
+
+```json
+{
+  "success": true,
+  "message": "Cache saved successfully",
+  "key": "user:alice",
+  "ttl": 3600,
+  "timestamp": 1713340800
+}
+```
+
+**示例：**
+
+```bash
+curl -X POST http://localhost:8080/api/cache/user:alice \
+  -H "Content-Type: application/json" \
+  -d '{"data": {"name": "Alice", "score": 99}, "ttl": 3600}'
+```
+
+---
+
+#### GET /api/cache/:key — 读取缓存
+
+**响应（200，命中）：**
+
+```json
+{
+  "success": true,
+  "cached": true,
+  "data": { "name": "Alice", "score": 99 },
+  "timestamp": 1713340800
+}
+```
+
+**响应（200，未命中或已过期）：**
+
+```json
+{
+  "success": true,
+  "cached": false,
+  "timestamp": 1713340800
+}
+```
+
+**示例：**
+
+```bash
+curl http://localhost:8080/api/cache/user:alice
+```
+
+---
+
+#### DELETE /api/cache/:key — 删除缓存
+
+**响应（200）：**
+
+```json
+{
+  "success": true,
+  "key": "user:alice",
+  "message": "deleted 1 item(s)",
+  "timestamp": 1713340800
+}
+```
+
+**示例：**
+
+```bash
+curl -X DELETE http://localhost:8080/api/cache/user:alice
+```
+
+---
+
+#### GET /api/cache-stats — 缓存统计
+
+**响应（200）：**
+
+```json
+{
+  "success": true,
+  "stats": {
+    "keyCount": 42,
+    "backend": "memory",
+    "memoryInfo": "total=50 active=42 expired=8 backend=memory"
+  },
+  "timestamp": 1713340800
+}
+```
+
+---
+
+#### GET /api/cache-keys — 列出所有缓存项
+
+返回最多 500 条缓存记录（按创建时间倒序），供 Dashboard 展示使用。
+
+**响应（200）：**
+
+```json
+[
+  {
+    "key": "user:alice",
+    "value": "{"name":"Alice","score":99}",
+    "expires_at": 1713344400,
+    "created_at": 1713340800
+  }
+]
+```
+
+---
+
+### 9.3 使用示例
+
+#### Python
+
+```python
+import requests
+
+BASE = "http://localhost:8080"
+
+# 写入缓存（TTL 10 分钟）
+requests.post(f"{BASE}/api/cache/user:alice",
+              json={"data": {"name": "Alice", "score": 99}, "ttl": 600})
+
+# 读取缓存
+resp = requests.get(f"{BASE}/api/cache/user:alice").json()
+if resp["cached"]:
+    print("命中:", resp["data"])
+else:
+    print("未命中，需重新计算")
+
+# 删除缓存
+requests.delete(f"{BASE}/api/cache/user:alice")
+```
+
+#### JavaScript / Node.js
+
+```javascript
+const BASE = "http://localhost:8080";
+
+// 写入缓存
+await fetch(`${BASE}/api/cache/user:alice`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ data: { name: "Alice", score: 99 }, ttl: 600 }),
+});
+
+// 读取缓存
+const resp = await fetch(`${BASE}/api/cache/user:alice`).then(r => r.json());
+if (resp.cached) {
+  console.log("命中:", resp.data);
+} else {
+  console.log("未命中");
+}
+
+// 删除缓存
+await fetch(`${BASE}/api/cache/user:alice`, { method: "DELETE" });
+```
+
+#### Go
+
+```go
+// 写入缓存
+body, _ := json.Marshal(map[string]interface{}{
+    "data": map[string]interface{}{"name": "Alice", "score": 99},
+    "ttl":  600,
+})
+http.Post("http://localhost:8080/api/cache/user:alice",
+    "application/json", bytes.NewReader(body))
+
+// 读取缓存
+resp, _ := http.Get("http://localhost:8080/api/cache/user:alice")
+var result map[string]interface{}
+json.NewDecoder(resp.Body).Decode(&result)
+if result["cached"].(bool) {
+    fmt.Println("命中:", result["data"])
+}
+```
+
+---
+
+### 9.4 过期清理机制
+
+- **惰性删除**：GET 时检查 `expires_at`，若已过期则立即删除并返回未命中。
+- **定时清理**：后台 goroutine 每 **1 分钟**扫描一次，批量删除所有已过期的缓存项，防止过期数据长期占用空间。
+
+---
+
+### 9.5 性能参考（memory vs file）
+
+以下数据来自 `examples/cache_bench` 压测工具（50 并发，30 秒，70% GET / 30% SET，Key 空间 1000）：
+
+| 指标 | memory 模式 | file 模式 | 说明 |
+|---|---|---|---|
+| 综合 TPS | ~370/s | ~363/s | 差距 < 2%，吞吐量相当 |
+| P50 延迟 | ~13 ms | ~16 ms | memory 略优 |
+| P95 延迟 | ~45 ms | ~153 ms | file 偶发磁盘 I/O 毛刺 |
+| RSS 峰值内存 | ~421 MB | ~33 MB | file 节省 **97.7%** 内存 |
+| 重启后数据 | 丢失 | 保留 | — |
+
+**选型建议：**
+
+- 追求**低延迟稳定性**（P95/P99 敏感，数据量可控）→ 选 `memory`
+- 追求**低内存占用 + 重启持久化**（大数据量，如文章/文档缓存）→ 选 `file`
+- 两者 TPS 吞吐量无明显差异，不是选型的决定因素
+
+---
+
+### 9.6 Cache Dashboard
+
+访问 `http://localhost:8080/cache-dashboard` 可打开可视化管理界面：
+
+| 功能 | 说明 |
+|---|---|
+| 统计概览 | 显示 total / active / expired 数量及当前 backend |
+| 写入缓存 | 图形界面填写 Key、Value（JSON）、TTL，一键写入 |
+| 读取缓存 | 按 Key 查询，显示完整响应（含 cached 状态） |
+| 删除缓存 | 按 Key 删除单条缓存 |
+| 缓存列表 | 列出所有缓存项，显示 Key、Value 预览、剩余 TTL、创建时间、状态（active/expired） |
+| 实时刷新 | 每 5 秒自动刷新统计和列表 |
+
+---
+
