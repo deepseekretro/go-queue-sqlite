@@ -1471,12 +1471,12 @@ func jsonResp(w http.ResponseWriter, code int, v interface{}) {
 }
 
 func handleCancelJob(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
+	if r.Method != http.MethodDelete && r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
-	// 从 URL 路径中提取 job id：/api/jobs/123
-	path := r.URL.Path // e.g. "/api/jobs/123"
+	// 从 URL 路径中提取 job id：/api/jobs/123 或 /api/jobs/123/cancel
+	path := r.URL.Path // e.g. "/api/jobs/123" or "/api/jobs/123/cancel"
 	parts := strings.Split(strings.TrimPrefix(path, "/api/jobs/"), "/")
 	if len(parts) == 0 || parts[0] == "" {
 		jsonResp(w, 400, map[string]string{"error": "missing job id"})
@@ -1953,7 +1953,7 @@ func main() {
 	})))
 	// /api/jobs/:id — DELETE to cancel a pending job
 	mux.HandleFunc("/api/jobs/", cors(auth(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodDelete {
+		if r.Method == http.MethodDelete || r.Method == http.MethodPost {
 			handleCancelJob(w, r)
 		} else {
 			http.NotFound(w, r)

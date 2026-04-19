@@ -188,11 +188,15 @@ const indexHTML = `<!DOCTYPE html>
   </div>
 
   <!-- Actions -->
-  <div class="panel">
+  <div class="panel" id="queue-actions-panel">
     <h2>🔧 Queue Actions</h2>
-    <div class="actions">
+    <div class="actions" style="margin-bottom:16px;">
       <button class="btn btn-warning" onclick="retryFailed()">↩ Retry All Failed</button>
       <button class="btn btn-danger"  onclick="clearFailed()">🗑 Clear Failed Table</button>
+    </div>
+    <div style="font-size:.82rem;font-weight:600;color:#94a3b8;margin-bottom:10px;letter-spacing:.04em;">QUEUE STATUS</div>
+    <div id="queue-status-list" style="display:flex;flex-wrap:wrap;gap:10px;">
+      <span style="color:#64748b;font-size:.78rem;">Loading...</span>
     </div>
   </div>
 
@@ -226,13 +230,14 @@ const indexHTML = `<!DOCTYPE html>
       </div>
       <div>
         <label>Tag</label>
-        <input type="text" id="f-tag" placeholder="filter by tag…" style="width:110px" oninput="jobsGoPage(1)">
+        <input type="text" id="f-tag" placeholder="filter by tag…" style="width:110px" oninput="jobsGoPage(1)" list="tag-suggestions" autocomplete="off">
+        <datalist id="tag-suggestions"></datalist>
       </div>
     </div>
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>ID</th><th>Queue</th><th>Job Type</th><th>Status</th><th>Attempts</th><th>Tags</th><th>Payload</th><th>Created</th><th>Updated</th></tr>
+          <tr><th>ID</th><th>Queue</th><th>Job Type</th><th>Status</th><th>Attempts</th><th>Tags</th><th>Payload</th><th>Created</th><th>Updated</th><th>Actions</th></tr>
         </thead>
         <tbody id="jobs-tbody">
           <tr><td colspan="9" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
@@ -704,7 +709,7 @@ async function loadJobs() {
   jobsTotalPages = pages;
 
   if (!jobs || jobs.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748b;padding:24px">No jobs found</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;color:#64748b;padding:24px">No jobs found</td></tr>';
   } else {
     tbody.innerHTML = jobs.map(j => {
       const payload = (() => { try { return JSON.parse(j.payload); } catch { return {}; } })();
@@ -723,6 +728,11 @@ async function loadJobs() {
       <td class="payload-cell" title="${j.payload.replace(/"/g,'&quot;')}">${payloadShort}</td>
       <td class="ts">${fmtTime(j.created_at)}</td>
       <td class="ts">${fmtTime(j.updated_at)}</td>
+      <td style="white-space:nowrap;">
+        ${j.status === 'pending' || j.status === 'running'
+          ? ` + "`" + `<button onclick="cancelJob(${j.id},this)" style="background:#2d1515;border:1px solid #7f1d1d;color:#f87171;padding:3px 9px;border-radius:5px;font-size:.75rem;cursor:pointer;" title="Cancel job">&#10005; Cancel</button>` + "`" + `
+          : ` + "`" + `<span style="color:#475569;font-size:.75rem;">—</span>` + "`" + `}
+      </td>
     </tr>` + "`" + `;
     }).join('');
   }
@@ -1414,6 +1424,100 @@ document.getElementById('cron-logs-modal').addEventListener('click', function(e)
 });
 
 
+
+// ─── Queue Status ─────────────────────────────────────────────────────────────
+
+async function loadQueueStatus() {
+  const res = await fetch('/api/queues');
+  if (!res.ok) return;
+  const queues = await res.json();
+  const el = document.getElementById('queue-status-list');
+  if (!el) return;
+  if (!queues || queues.length === 0) {
+    el.innerHTML = '<span style="color:#475569;font-size:.78rem;">No queues</span>';
+    return;
+  }
+  // 获取各队列 pending 数量（从 stats）
+  let queuePending = {};
+  try {
+    const sr = await fetch('/api/stats');
+    if (sr.ok) {
+      const s = await sr.json();
+      queuePending = s.queue_pending || {};
+    }
+  } catch(e) {}
+
+  el.innerHTML = queues.map(q => {
+    const paused = q.paused;
+    const pending = queuePending[q.name] || 0;
+    const statusStyle = paused
+      ? 'background:#1e293b;border:1px solid #334155;color:#64748b;'
+      : 'background:#1c3a2e;border:1px solid #059669;color:#34d399;';
+    const statusDot = paused ? '⏸' : '▶';
+    const toggleLabel = paused ? 'Resume' : 'Pause';
+    const toggleStyle = paused
+      ? 'background:#1c3a2e;border:1px solid #059669;color:#34d399;'
+      : 'background:#1e293b;border:1px solid #334155;color:#94a3b8;';
+    return ` + "`" + `<div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:12px;min-width:180px;">
+      <div>
+        <div style="font-size:.8rem;font-weight:600;color:#e2e8f0;">${statusDot} ${escHtml(q.name)}</div>
+        <div style="font-size:.72rem;color:#64748b;margin-top:2px;">${pending} pending</div>
+      </div>
+      <button onclick="toggleQueuePause('${escHtml(q.name)}',${!paused},this)"
+        style="${toggleStyle}padding:3px 10px;border-radius:5px;font-size:.72rem;cursor:pointer;margin-left:auto;">
+        ${toggleLabel}
+      </button>
+    </div>` + "`" + `;
+  }).join('');
+}
+
+async function toggleQueuePause(queue, pause, btn) {
+  btn.disabled = true;
+  const action = pause ? 'pause' : 'resume';
+  const res = await fetch(` + "`" + `/api/queues/${encodeURIComponent(queue)}/${action}` + "`" + `, {method: 'POST'});
+  if (res.ok) {
+    toast(pause ? ` + "`" + `⏸ Queue "${queue}" paused` + "`" + ` : ` + "`" + `▶ Queue "${queue}" resumed` + "`" + `);
+    loadQueueStatus();
+  } else {
+    const d = await res.json().catch(() => ({}));
+    toast('❌ ' + (d.error || 'Failed'), 'err');
+    btn.disabled = false;
+  }
+}
+
+// ─── Tag Suggestions ──────────────────────────────────────────────────────────
+
+async function loadTagSuggestions() {
+  try {
+    const res = await fetch('/api/tags');
+    if (!res.ok) return;
+    const data = await res.json();
+    const tags = data.tags || [];
+    const dl = document.getElementById('tag-suggestions');
+    if (dl) {
+      dl.innerHTML = tags.map(t => ` + "`" + `<option value="${escHtml(t)}">` + "`" + `).join('');
+    }
+  } catch(e) {}
+}
+
+// ─── Cancel Job ───────────────────────────────────────────────────────────────
+
+async function cancelJob(id, btn) {
+  if (!confirm(` + "`" + `Cancel Job #${id}?` + "`" + `)) return;
+  btn.disabled = true;
+  btn.textContent = '…';
+  const res = await fetch(` + "`" + `/api/jobs/${id}/cancel` + "`" + `, {method: 'POST'});
+  if (res.ok) {
+    toast(` + "`" + `✅ Job #${id} cancelled` + "`" + `);
+    loadJobs();
+  } else {
+    const d = await res.json().catch(() => ({}));
+    toast('❌ ' + (d.error || 'Failed'), 'err');
+    btn.disabled = false;
+    btn.innerHTML = '&#10005; Cancel';
+  }
+}
+
 async function loadQueuesForFilter() {
   try {
     const res = await fetch('/api/queues');
@@ -1427,7 +1531,7 @@ async function loadQueuesForFilter() {
   } catch(e) { /* 保持现有选项 */ }
 }
 
-function loadAll() { loadStats(); loadJobs(); loadCrons(); loadBatches(); loadRateLimits(); loadAutoScale(); loadSystem(); }
+function loadAll() { loadStats(); loadJobs(); loadCrons(); loadBatches(); loadRateLimits(); loadAutoScale(); loadSystem(); loadQueueStatus(); loadTagSuggestions(); }
 
 // SSE 实时推送：stats 变化时自动刷新，无需轮询
 (function initSSE() {
