@@ -739,7 +739,7 @@ func getNotifyCh(queue string) chan struct{} {
 	if ch, ok := notifyDispatchMap[queue]; ok {
 		return ch
 	}
-	ch := make(chan struct{}, 64)
+	ch := make(chan struct{}, 1)
 	notifyDispatchMap[queue] = ch
 	return ch
 }
@@ -944,9 +944,20 @@ func startWsDispatcher(queue string) {
 				return
 			case <-notifyCh:
 				// 收到通知，立即尝试派发
-			case <-time.After(100 * time.Millisecond):
-				// 兜底轮询，100ms 间隔，提高响应速度
+			case <-time.After(10 * time.Millisecond):
+				// 兜底轮询，10ms 间隔，提高响应速度
 			}
+
+			// drain：把 notifyCh 里积压的所有信号一次性消费掉，
+			// 避免下面的派发循环结束后立即被重复唤醒（空转）
+			for {
+				select {
+				case <-notifyCh:
+				default:
+					goto drained
+				}
+			}
+			drained:
 
 			// P3-A: 队列暂停时跳过派发
 			if isQueuePaused(queue) {
@@ -993,11 +1004,11 @@ func startWsDispatcher(queue string) {
 				}
 				// 如果本轮没有成功派发任何任务，退出循环避免空转
 				if dispatched == 0 {
-					// 所有取出的任务都已放回 pending（在上面的 dispatchToWs 失败处理中）
-					// 立即触发一次通知，让下次轮询尽快重试（而不是等 100ms）
-					go func() { notifyQueue(queue) }()
 					break
 				}
+				// 本轮成功派发了任务，继续循环检查是否还有更多 idle worker + pending 任务
+				// 这解决了"多个 worker 同时完成，notifyQueue 信号被丢弃"的问题：
+				// 不依赖外部通知，主动把所有 idle worker 填满
 			}
 		}
 	}()
