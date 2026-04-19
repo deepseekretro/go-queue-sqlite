@@ -9,7 +9,7 @@ const indexHTML = `<!DOCTYPE html>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
-  header { background: linear-gradient(135deg, #1e3a5f, #0f172a); padding: 20px 32px; border-bottom: 1px solid #1e40af; display: flex; align-items: center; gap: 12px; }
+  header { background: linear-gradient(135deg, #1e3a5f, #0f172a); padding: 20px 32px; border-bottom: 1px solid #1e40af; display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 200; }
   header h1 { font-size: 1.5rem; color: #60a5fa; }
   header span { font-size: 0.85rem; color: #64748b; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 9999px; font-size: 0.72rem; font-weight: 600; }
@@ -135,12 +135,27 @@ const indexHTML = `<!DOCTYPE html>
   }
 
   /* ── Nav Tabs ─────────────────────────────────────────────────────────────── */
+  #nav-tabs-wrap {
+    position: sticky;
+    top: 72px;  /* header 高度 */
+    z-index: 100;
+    background: rgba(15,23,42,.92);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid #1e293b;
+    box-shadow: 0 2px 16px rgba(0,0,0,.45);
+    margin: 0 -32px;          /* 撑满 container 两侧 padding */
+    padding: 8px 32px;
+  }
+  #nav-tabs {
+    display: flex; gap: 6px; flex-wrap: wrap;
+  }
   .nav-tab {
     background: #1e293b; border: 1px solid #334155; color: #94a3b8;
     padding: 6px 14px; border-radius: 6px; font-size: .78rem; cursor: pointer;
-    transition: all .15s;
+    transition: all .15s; white-space: nowrap;
   }
-  .nav-tab:hover { border-color: #6366f1; color: #a5b4fc; }
+  .nav-tab:hover { border-color: #6366f1; color: #a5b4fc; background: #1e2a4a; }
   .nav-tab.active { background: #312e81; border-color: #6366f1; color: #c7d2fe; font-weight: 600; }
 </style>
 </head>
@@ -166,16 +181,18 @@ const indexHTML = `<!DOCTYPE html>
 <div class="container">
 
   <!-- Nav Tabs -->
-  <div id="nav-tabs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px;padding:12px 0 0;border-bottom:1px solid #1e293b;">
-    <button class="nav-tab active" onclick="scrollToPanel('stats')">📊 Stats</button>
-    <button class="nav-tab" onclick="scrollToPanel('workers-panel')">🖥 Workers</button>
-    <button class="nav-tab" onclick="scrollToPanel('queue-actions-panel')">🔧 Queues</button>
-    <button class="nav-tab" onclick="scrollToPanel('jobs-panel')">📋 Jobs</button>
-    <button class="nav-tab" onclick="scrollToPanel('crons-panel')">⏰ Crons</button>
-    <button class="nav-tab" onclick="scrollToPanel('batches-panel')">📦 Batches</button>
-    <button class="nav-tab" onclick="scrollToPanel('rate-limits-panel')">⚡ Rate Limits</button>
-    <button class="nav-tab" onclick="scrollToPanel('autoscale-panel')">🔄 AutoScale</button>
-    <button class="nav-tab" onclick="scrollToPanel('system-panel')">🗄 System</button>
+  <div id="nav-tabs-wrap">
+    <div id="nav-tabs">
+      <button class="nav-tab active" onclick="scrollToPanel('stats')">📊 Stats</button>
+      <button class="nav-tab" onclick="scrollToPanel('workers-panel')">🖥 Workers</button>
+      <button class="nav-tab" onclick="scrollToPanel('queue-actions-panel')">🔧 Queues</button>
+      <button class="nav-tab" onclick="scrollToPanel('jobs-panel')">📋 Jobs</button>
+      <button class="nav-tab" onclick="scrollToPanel('crons-panel')">⏰ Crons</button>
+      <button class="nav-tab" onclick="scrollToPanel('batches-panel')">📦 Batches</button>
+      <button class="nav-tab" onclick="scrollToPanel('rate-limits-panel')">⚡ Rate Limits</button>
+      <button class="nav-tab" onclick="scrollToPanel('autoscale-panel')">🔄 AutoScale</button>
+      <button class="nav-tab" onclick="scrollToPanel('system-panel')">🗄 System</button>
+    </div>
   </div>
 
   <!-- Stats -->
@@ -1588,19 +1605,23 @@ function toggleJobDetail(id, row) {
 function scrollToPanel(id) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.scrollIntoView({behavior: 'smooth', block: 'start'});
+  // 计算固定头部总高度（header + nav-tabs-wrap）
+  const header = document.querySelector('header');
+  const navWrap = document.getElementById('nav-tabs-wrap');
+  const offset = (header ? header.offsetHeight : 0) + (navWrap ? navWrap.offsetHeight : 0) + 8;
+  const top = el.getBoundingClientRect().top + window.scrollY - offset;
+  window.scrollTo({top: top, behavior: 'smooth'});
   // 高亮激活的 tab
   document.querySelectorAll('.nav-tab').forEach(function(btn) {
     btn.classList.remove('active');
   });
-  // 找对应的 tab 按钮
-  const tabs = document.querySelectorAll('.nav-tab');
-  tabs.forEach(function(btn) {
+  document.querySelectorAll('.nav-tab').forEach(function(btn) {
     if (btn.getAttribute('onclick') && btn.getAttribute('onclick').includes("'" + id + "'")) {
       btn.classList.add('active');
     }
   });
 }
+
 
 async function loadQueuesForFilter() {
   try {
@@ -1633,6 +1654,19 @@ function loadAll() { loadStats(); loadJobs(); loadCrons(); loadBatches(); loadRa
 
 loadQueuesForFilter();
 loadAll();
+
+// ─── 动态设置 nav-tabs-wrap 的 top（等于 header 高度）─────────────────────────
+(function initNavTabsTop() {
+  function setNavTop() {
+    const header = document.querySelector('header');
+    const navWrap = document.getElementById('nav-tabs-wrap');
+    if (header && navWrap) {
+      navWrap.style.top = header.offsetHeight + 'px';
+    }
+  }
+  setNavTop();
+  window.addEventListener('resize', setNavTop);
+})();
 
 // ─── 获取当前登录用户名 ─────────────────────────────────────────────────────
 fetch('/api/me', {credentials: 'same-origin'})

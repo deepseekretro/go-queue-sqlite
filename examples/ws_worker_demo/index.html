@@ -151,7 +151,10 @@
       <div class="worker-config">
         <div>
           <label>Worker 监听队列</label>
-          <select id="ws-queue"><option value="">加载中...</option></select>
+          <select id="ws-queue">
+            <option value="default">default</option>
+            <option value="emails">emails</option>
+          </select>
         </div>
         <div>
           <label>处理延迟模拟 (ms)</label>
@@ -205,7 +208,11 @@
     <div class="form-grid">
       <div>
         <label>Queue</label>
-        <select id="d-queue"><option value="">加载中...</option></select>
+        <select id="d-queue">
+          <option value="default">default</option>
+          <option value="emails">emails</option>
+          <option value="reports">reports</option>
+        </select>
       </div>
       <div>
         <label>Job Type</label>
@@ -481,8 +488,6 @@ async function batchDispatch(jobType, count) {
   loadAll();
 }
 
-async 
-
 
 // ─── Dynamic Queue Loading ────────────────────────────────────────────────────
 async function loadQueues() {
@@ -519,10 +524,10 @@ async function loadQueues() {
   }
 }
 
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.getElementById('code-js-content').textContent = JS_CODE;
 document.getElementById('code-python-content').textContent = PYTHON_CODE;
-// 先加载队列列表，再初始化模板（fillTemplate 依赖 d-type 的值）
 loadQueues().then(() => fillTemplate());
 </script>
 </body>
