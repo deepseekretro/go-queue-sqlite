@@ -151,10 +151,7 @@
       <div class="worker-config">
         <div>
           <label>Worker 监听队列</label>
-          <select id="ws-queue">
-            <option value="default">default</option>
-            <option value="emails">emails</option>
-          </select>
+          <select id="ws-queue"><option value="">加载中...</option></select>
         </div>
         <div>
           <label>处理延迟模拟 (ms)</label>
@@ -208,11 +205,7 @@
     <div class="form-grid">
       <div>
         <label>Queue</label>
-        <select id="d-queue">
-          <option value="default">default</option>
-          <option value="emails">emails</option>
-          <option value="reports">reports</option>
-        </select>
+        <select id="d-queue"><option value="">加载中...</option></select>
       </div>
       <div>
         <label>Job Type</label>
@@ -490,10 +483,47 @@ async function batchDispatch(jobType, count) {
 
 async 
 
+
+// ─── Dynamic Queue Loading ────────────────────────────────────────────────────
+async function loadQueues() {
+  try {
+    const res = await fetch('/api/queues');
+    const queues = await res.json();
+    const names = queues.map(q => q.name).sort();
+
+    // 填充 Worker 监听队列 select
+    const wsSelect = document.getElementById('ws-queue');
+    wsSelect.innerHTML = names.map(n =>
+      `<option value="${n}"${n === 'default' ? ' selected' : ''}>${n}${queues.find(q=>q.name===n)?.paused ? ' (paused)' : ''}</option>`
+    ).join('');
+    // 如果没有 default，选第一个
+    if (!names.includes('default') && names.length > 0) {
+      wsSelect.value = names[0];
+    }
+
+    // 填充 Dispatch Job 队列 select
+    const dSelect = document.getElementById('d-queue');
+    dSelect.innerHTML = names.map(n =>
+      `<option value="${n}"${n === 'default' ? ' selected' : ''}>${n}${queues.find(q=>q.name===n)?.paused ? ' (paused)' : ''}</option>`
+    ).join('');
+    if (!names.includes('default') && names.length > 0) {
+      dSelect.value = names[0];
+    }
+  } catch (e) {
+    console.warn('[loadQueues] failed:', e);
+    // 降级：写入默认值
+    ['ws-queue', 'd-queue'].forEach(id => {
+      document.getElementById(id).innerHTML =
+        '<option value="default">default</option>';
+    });
+  }
+}
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.getElementById('code-js-content').textContent = JS_CODE;
 document.getElementById('code-python-content').textContent = PYTHON_CODE;
-fillTemplate();
+// 先加载队列列表，再初始化模板（fillTemplate 依赖 d-type 的值）
+loadQueues().then(() => fillTemplate());
 </script>
 </body>
 </html>
