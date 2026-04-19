@@ -85,7 +85,12 @@ var doneCoalesceCh = make(chan doneReq, 4096)
 func startDBWriter() {
 	go func() {
 		for req := range dbArbiterCh {
+			t0Arb := time.Now()
 			err := req.fn()
+			arbMs := time.Since(t0Arb).Milliseconds()
+			if arbMs > 50 {
+				log.Printf("[DBArbiter] slow op: %dms", arbMs)
+			}
 			if req.result != nil {
 				req.result <- err
 			}
@@ -184,6 +189,7 @@ func startDoneCoalescer() {
 			pending = make([]doneReq, 0, 64)
 			dbArbiterCh <- dbWriteReq{
 				fn: func() error {
+					t0Done := time.Now()
 					tx, err := db.Begin()
 					if err != nil {
 						return err
@@ -199,8 +205,8 @@ func startDoneCoalescer() {
 						stmt.Exec(req.ts, req.ts, req.id) //nolint
 					}
 					err2 := tx.Commit()
+					log.Printf("[DoneCoalescer] flush n=%d tx_ms=%d", len(batch), time.Since(t0Done).Milliseconds())
 					if err2 == nil {
-						// Bug C 修复：在 UPDATE 提交后再广播统计，确保 stats 反映最新状态
 						broadcastStats()
 					}
 					return err2
@@ -310,7 +316,7 @@ func (slogWriter) Write(p []byte) (n int, err error) {
 
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite", "./queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(200)")
+	db, err = sql.Open("sqlite", "/tmp/queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(200)")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -504,8 +510,11 @@ func reserveBatch(queue string, n int) ([]*Job, error) {
 	resultCh := make(chan result, 1)
 
 	// 把 SELECT + UPDATE 全部放入 writer goroutine，原子执行，消除并发写冲突
+	t0Reserve := time.Now()
 	dbArbiterCh <- dbWriteReq{
 		fn: func() error {
+			log.Printf("[reserveBatch:%s] queue_wait=%dms", queue, time.Since(t0Reserve).Milliseconds())
+			t1Reserve := time.Now()
 			now := time.Now().Unix()
 			rows, err := db.Query(
 				`SELECT id, queue, payload, attempts, status, priority, available_at, started_at, finished_at, created_at, updated_at
@@ -550,10 +559,10 @@ func reserveBatch(queue string, n int) ([]*Job, error) {
 				j.StartedAt = now
 				jobs = append(jobs, j)
 			}
+			log.Printf("[reserveBatch:%s] sql_ms=%d n=%d", queue, time.Since(t1Reserve).Milliseconds(), len(jobs))
 			resultCh <- result{jobs, nil}
 			return nil
 		},
-		result: make(chan error, 1),
 	}
 	r := <-resultCh
 	return r.jobs, r.err
@@ -939,17 +948,17 @@ func startWsDispatcher(queue string) {
 	notifyCh := getNotifyCh(queue)
 	go func() {
 		for {
+			wakeReason := "poll"
 			select {
 			case <-stopGoWorker:
 				return
 			case <-notifyCh:
-				// 收到通知，立即尝试派发
+				wakeReason = "notify"
 			case <-time.After(10 * time.Millisecond):
-				// 兜底轮询，10ms 间隔，提高响应速度
+				wakeReason = "poll"
 			}
 
-			// drain：把 notifyCh 里积压的所有信号一次性消费掉，
-			// 避免下面的派发循环结束后立即被重复唤醒（空转）
+			// drain：把 notifyCh 里积压的所有信号一次性消费掉
 			for {
 				select {
 				case <-notifyCh:
@@ -977,38 +986,35 @@ func startWsDispatcher(queue string) {
 				if batchSize > 32 {
 					batchSize = 32
 				}
+				log.Printf("[WsDispatcher:%s] wake=%s idle=%d batch=%d", queue, wakeReason, idleCount, batchSize)
 				jobs, err := reserveBatch(queue, batchSize)
 				if err != nil {
 					log.Printf("[WsDispatcher] reserveBatch error: %v", err)
 					break
 				}
 				if len(jobs) == 0 {
+					log.Printf("[WsDispatcher:%s] reserveBatch=0 (idle=%d)", queue, idleCount)
 					break
 				}
 
 				// 逐个派发给空闲 worker
 				dispatched := 0
 				for _, j := range jobs {
-					// Bug 17 修复：WS Worker 也需要经过限流检查
 					if checkRateLimit(j) {
-						// 超限，任务已被 checkRateLimit 放回 pending（延迟 60s）
 						continue
 					}
 					if !hub.dispatchToWs(j) {
-						// 没有空闲 worker 了，放回 pending（不减少 attempts）
 						dbExec(`UPDATE jobs SET status='pending', updated_at=? WHERE id=?`,
 							time.Now().Unix(), j.ID) //nolint
 					} else {
 						dispatched++
 					}
 				}
-				// 如果本轮没有成功派发任何任务，退出循环避免空转
+				log.Printf("[WsDispatcher:%s] dispatched=%d/%d wake=%s", queue, dispatched, len(jobs), wakeReason)
 				if dispatched == 0 {
 					break
 				}
-				// 本轮成功派发了任务，继续循环检查是否还有更多 idle worker + pending 任务
-				// 这解决了"多个 worker 同时完成，notifyQueue 信号被丢弃"的问题：
-				// 不依赖外部通知，主动把所有 idle worker 填满
+				wakeReason = "loop"
 			}
 		}
 	}()
@@ -1206,6 +1212,7 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 				hub.mu.Unlock()
 				// worker 变为 idle，立即通知 dispatcher 可以派发下一个任务
 				if worker.queue != "" {
+				log.Printf("[WS] worker %s done, notifying queue=%s", workerID, worker.queue)
 					notifyQueue(worker.queue)
 				} else {
 					// 通配 worker（queue=""）：通知所有活跃队列的 dispatcher
