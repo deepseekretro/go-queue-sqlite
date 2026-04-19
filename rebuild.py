@@ -29,9 +29,10 @@ GO_BIN      = '/tmp/go/bin/go'
 # 部署目录：全部放在 /tmp/goapp/，不污染源码目录
 DEPLOY_DIR  = '/tmp/goapp'
 BINARY      = os.path.join(DEPLOY_DIR, 'goapp')
+BINARY_NEW  = os.path.join(DEPLOY_DIR, 'goapp.new')   # 编译临时产物
 DB_FILE     = os.path.join(DEPLOY_DIR, 'queue.db')
 LOG_FILE    = os.path.join(DEPLOY_DIR, 'goapp.log')
-DB_SEED     = os.path.join(SCRIPT_DIR, 'queue.db')   # 源码目录里的种子 DB（可选）
+DB_SEED     = os.path.join(SCRIPT_DIR, 'queue.db')    # 源码目录里的种子 DB（可选）
 
 BUILD_ENV = {
     **os.environ,
@@ -68,11 +69,11 @@ def err(msg):
 os.makedirs(DEPLOY_DIR, exist_ok=True)
 
 
-# ── 1. 编译（直接输出到 /tmp/goapp/goapp）────────────────
-step(f'编译 goapp → {BINARY} ...')
+# ── 1. 编译到临时路径 goapp.new ───────────────────────────
+step(f'编译 goapp → {BINARY_NEW} ...')
 t0 = time.time()
 res = subprocess.run(
-    [GO_BIN, 'build', '-v', '-o', BINARY, '.'],
+    [GO_BIN, 'build', '-v', '-o', BINARY_NEW, '.'],
     capture_output=True, text=True,
     cwd=SCRIPT_DIR,
     env=BUILD_ENV,
@@ -92,7 +93,7 @@ else:
     ok(f'编译成功（{elapsed:.1f}s）— 全部命中缓存，仅重新链接')
 
 
-# ── 2. 停止旧 goapp 进程 ─────────────────────────────────────────
+# ── 2. 停止旧 goapp 进程 ─────────────────────────────────
 step('停止旧 goapp 进程 ...')
 
 # 同时覆盖新路径（/tmp/goapp/goapp）和旧路径（.../goapp/goapp）
@@ -100,7 +101,7 @@ for pattern in [r'/tmp/goapp/goapp', r'goapp/goapp']:
     subprocess.run(['pkill', '-SIGTERM', '-f', pattern], capture_output=True)
 time.sleep(2)
 
-# 检查是否还有残留（匹配任意 goapp 二进制）
+# 检查是否还有残留
 r = subprocess.run(['pgrep', '-f', r'goapp/goapp'], capture_output=True, text=True)
 if r.stdout.strip():
     print(f'  进程仍在（PID {r.stdout.strip()}），发送 SIGKILL ...')
@@ -116,7 +117,13 @@ if r.stdout.strip():
 ok('旧进程已停止')
 
 
-# ── 3. 启动新进程 ─────────────────────────────────────────
+# ── 3. 原子替换二进制 mv goapp.new → goapp ───────────────
+step(f'替换二进制: {BINARY_NEW} → {BINARY}')
+os.replace(BINARY_NEW, BINARY)   # os.replace = atomic rename(2) on same filesystem
+ok(f'二进制已替换')
+
+
+# ── 4. 启动新进程 ─────────────────────────────────────────
 if '--no-start' in sys.argv:
     print('\n  --no-start 模式，跳过启动')
     sys.exit(0)
