@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -52,7 +54,36 @@ var cacheBackend string // "memory" | "file"
 //
 //	backend = "memory" → SQLite :memory:（进程内，重启丢失）
 //	backend = "file"   → 与主 DB 同目录的 cache.db 文件
+// checkMemoryForCacheBackend 检测本机可用内存，
+// 若总内存 < 1GB 且当前选择了 memory 模式，则输出建议日志提示切换到 file 模式。
+func checkMemoryForCacheBackend(backend string) {
+	const oneGB = uint64(1 << 30) // 1 GiB
+
+	var totalMem uint64
+	switch runtime.GOOS {
+	case "linux", "android":
+		var info syscall.Sysinfo_t
+		if err := syscall.Sysinfo(&info); err == nil {
+			totalMem = info.Totalram * uint64(info.Unit)
+		}
+	default:
+		// 其他平台（macOS/Windows）无法通过 syscall.Sysinfo 获取，跳过检测
+		log.Printf("[Cache] 内存检测：当前平台 (%s) 不支持自动检测，跳过", runtime.GOOS)
+		return
+	}
+
+	log.Printf("[Cache] 内存检测：本机总内存 = %.2f MB，cache-backend = %s",
+		float64(totalMem)/(1<<20), backend)
+
+	if totalMem < oneGB && backend == "memory" {
+		log.Printf("[Cache] ⚠️  警告：本机内存不足 1GB（%.2f MB），建议使用 file 模式以避免内存压力。"+
+			" 启动参数加上 -cache-backend=file 即可切换。",
+			float64(totalMem)/(1<<20))
+	}
+}
+
 func initCacheDB(mainDBPath, backend string) {
+	checkMemoryForCacheBackend(backend)
 	cacheBackend = backend
 
 	var dsn string
