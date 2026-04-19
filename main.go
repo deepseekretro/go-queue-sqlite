@@ -2170,6 +2170,7 @@ func main() {
 	mux.HandleFunc("/logout", handleLogout)
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/examples/", handleExamples)
+	mux.HandleFunc("/static/", handleStatic)
 	mux.HandleFunc("/metrics", handleMetrics)
 	mux.HandleFunc("/ws/worker", handleWorkerWS)
 	mux.HandleFunc("/api/jobs", cors(auth(func(w http.ResponseWriter, r *http.Request) {
@@ -2221,6 +2222,7 @@ func main() {
 	mux.HandleFunc("/api/me", requireLogin(handleMe))
 	mux.HandleFunc("/api/cache/", cors(auth(cacheRouter)))
 	mux.HandleFunc("/api/cache-stats", cors(auth(cacheRouter)))
+	mux.HandleFunc("/api/cache-keys", cors(auth(cacheRouter)))
 	mux.HandleFunc("/api/events", requireLogin(handleSSE))
 	mux.HandleFunc("/api/jobs/failed", cors(auth(handleClearFailed)))
 	mux.HandleFunc("/api/jobs/retry-failed", cors(auth(handleRetryFailed)))

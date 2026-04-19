@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cache Dashboard · Go Queue</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+
+header {
+  background: linear-gradient(135deg, #1e3a5f, #0f172a);
+  padding: 16px 32px;
+  border-bottom: 1px solid #1e40af;
+  display: flex; align-items: center; gap: 12px;
+}
+header h1 { font-size: 1.3rem; color: #60a5fa; }
+header .back {
+  margin-left: auto;
+  font-size: .8rem; padding: 5px 12px;
+  background: #1e293b; border: 1px solid #334155;
+  color: #a78bfa; border-radius: 6px; text-decoration: none;
+}
+header .back:hover { opacity: .8; }
+
+.container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+
+/* ── Stats bar ── */
+.stats-bar {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px; margin-bottom: 24px;
+}
+.stat-card {
+  background: #1e293b; border: 1px solid #334155;
+  border-radius: 12px; padding: 16px; text-align: center;
+}
+.stat-card .num { font-size: 2rem; font-weight: 700; }
+.stat-card .lbl { font-size: .75rem; color: #94a3b8; margin-top: 4px; }
+.num-total   { color: #60a5fa; }
+.num-active  { color: #34d399; }
+.num-expired { color: #f87171; }
+.num-backend { color: #a78bfa; font-size: 1rem !important; }
+
+/* ── Panel ── */
+.panel {
+  background: #1e293b; border: 1px solid #334155;
+  border-radius: 12px; padding: 20px; margin-bottom: 24px;
+}
+.panel h2 { font-size: 1rem; color: #93c5fd; margin-bottom: 16px; }
+
+/* ── Form ── */
+.form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
+.form-group { display: flex; flex-direction: column; gap: 4px; }
+.form-group label { font-size: .75rem; color: #94a3b8; }
+.form-group input, .form-group textarea {
+  background: #0f172a; border: 1px solid #334155;
+  border-radius: 8px; color: #e2e8f0;
+  padding: 8px 10px; font-size: .85rem; outline: none;
+  transition: border .2s;
+}
+.form-group input:focus, .form-group textarea:focus { border-color: #3b82f6; }
+.form-group textarea { resize: vertical; min-height: 72px; font-family: monospace; width: 340px; }
+.form-group input { width: 200px; }
+.form-group input.short { width: 100px; }
+
+.btn {
+  padding: 8px 18px; border-radius: 8px; border: none;
+  cursor: pointer; font-size: .85rem; font-weight: 600;
+  transition: opacity .2s;
+}
+.btn:hover { opacity: .85; }
+.btn-primary { background: #3b82f6; color: #fff; }
+.btn-danger  { background: #ef4444; color: #fff; }
+.btn-sm { padding: 4px 10px; font-size: .75rem; }
+
+/* ── Table ── */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+th {
+  background: #0f172a; color: #64748b;
+  padding: 10px 12px; text-align: left;
+  border-bottom: 1px solid #1e293b; white-space: nowrap;
+}
+td { padding: 9px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }
+tr:hover td { background: #1a2744; }
+.mono { font-family: monospace; font-size: .78rem; color: #94a3b8; }
+.key-cell { color: #fbbf24; font-family: monospace; font-size: .82rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.val-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-family: monospace; font-size: .75rem; }
+.badge {
+  display: inline-block; padding: 2px 8px;
+  border-radius: 9999px; font-size: .7rem; font-weight: 600;
+}
+.badge-ok  { background: #1c3a2a; color: #34d399; }
+.badge-exp { background: #3b1a1a; color: #f87171; }
+
+/* ── Toast ── */
+#toast {
+  position: fixed; bottom: 24px; right: 24px;
+  padding: 10px 18px; border-radius: 8px;
+  font-size: .85rem; font-weight: 600;
+  opacity: 0; transition: opacity .3s;
+  pointer-events: none; z-index: 9999;
+}
+#toast.show { opacity: 1; }
+#toast.ok  { background: #166534; color: #bbf7d0; border: 1px solid #16a34a; }
+#toast.err { background: #7f1d1d; color: #fecaca; border: 1px solid #dc2626; }
+
+/* ── Detail modal ── */
+#detail-modal {
+  display: none; position: fixed; inset: 0;
+  background: rgba(0,0,0,.6); z-index: 1000;
+  align-items: center; justify-content: center;
+}
+#detail-modal.open { display: flex; }
+.modal-box {
+  background: #1e293b; border: 1px solid #334155;
+  border-radius: 12px; padding: 24px;
+  width: 560px; max-width: 95vw; max-height: 80vh;
+  overflow-y: auto;
+}
+.modal-box h3 { color: #93c5fd; margin-bottom: 16px; font-size: .95rem; }
+.modal-box pre {
+  background: #0f172a; border: 1px solid #334155;
+  border-radius: 8px; padding: 14px;
+  font-size: .78rem; color: #a5f3fc;
+  white-space: pre-wrap; word-break: break-all;
+  max-height: 300px; overflow-y: auto;
+}
+.modal-close {
+  float: right; background: none; border: none;
+  color: #64748b; font-size: 1.2rem; cursor: pointer;
+}
+.modal-close:hover { color: #e2e8f0; }
+</style>
+</head>
+<body>
+
+<header>
+  <span style="font-size:1.5rem;">🗃</span>
+  <h1>Cache Dashboard</h1>
+  <span style="font-size:.8rem;color:#64748b;margin-left:4px;">SQLite-backed · TTL · GET / SET / DELETE</span>
+  <a href="/" class="back">← Back to Queue</a>
+</header>
+
+<div class="container">
+
+  <!-- Stats -->
+  <div class="stats-bar">
+    <div class="stat-card">
+      <div class="num num-active" id="stat-active">—</div>
+      <div class="lbl">ACTIVE KEYS</div>
+    </div>
+    <div class="stat-card">
+      <div class="num num-expired" id="stat-expired">—</div>
+      <div class="lbl">EXPIRED (pending GC)</div>
+    </div>
+    <div class="stat-card">
+      <div class="num num-total" id="stat-total">—</div>
+      <div class="lbl">TOTAL KEYS</div>
+    </div>
+    <div class="stat-card">
+      <div class="num num-backend" id="stat-backend">—</div>
+      <div class="lbl">BACKEND</div>
+    </div>
+  </div>
+
+  <!-- SET / GET panel -->
+  <div class="panel">
+    <h2>🔧 Set / Get Cache</h2>
+    <div class="form-row">
+      <div class="form-group">
+        <label>Key</label>
+        <input id="f-key" placeholder="my:cache:key" />
+      </div>
+      <div class="form-group">
+        <label>TTL (seconds, 0 = forever)</label>
+        <input id="f-ttl" type="number" value="3600" class="short" />
+      </div>
+      <div class="form-group" style="flex:1;">
+        <label>Value (JSON)</label>
+        <textarea id="f-value" placeholder='{"hello": "world"}'></textarea>
+      </div>
+    </div>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;">
+      <button class="btn btn-primary" onclick="doSet()">💾 Set</button>
+      <button class="btn" style="background:#1e3a5f;border:1px solid #3b82f6;color:#60a5fa;" onclick="doGet()">🔍 Get</button>
+      <button class="btn btn-danger" onclick="doDelete()">🗑 Delete</button>
+    </div>
+    <!-- GET result -->
+    <div id="get-result" style="display:none;margin-top:16px;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:14px;">
+      <div style="font-size:.75rem;color:#64748b;margin-bottom:6px;">GET Result</div>
+      <pre id="get-result-pre" style="font-size:.8rem;color:#a5f3fc;white-space:pre-wrap;word-break:break-all;"></pre>
+    </div>
+  </div>
+
+  <!-- Keys table -->
+  <div class="panel">
+    <h2 style="display:flex;align-items:center;justify-content:space-between;">
+      <span>📋 All Cache Keys</span>
+      <div style="display:flex;gap:8px;">
+        <input id="search-key" placeholder="Filter keys…" style="background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:5px 10px;font-size:.78rem;width:180px;outline:none;" oninput="renderTable()" />
+        <button class="btn btn-sm" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;" onclick="loadAll()">↻ Refresh</button>
+      </div>
+    </h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Value (preview)</th>
+            <th>TTL / Expires</th>
+            <th>Created</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="keys-tbody">
+          <tr><td colspan="6" style="color:#475569;text-align:center;padding:24px;">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="keys-empty" style="display:none;text-align:center;padding:32px;color:#475569;font-size:.85rem;">No cache keys found</div>
+  </div>
+
+</div>
+
+<!-- Detail modal -->
+<div id="detail-modal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeModal()">✕</button>
+    <h3 id="modal-key-title">Key: —</h3>
+    <pre id="modal-value-pre"></pre>
+    <div style="margin-top:12px;font-size:.75rem;color:#64748b;" id="modal-meta"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API = '';  // same origin
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+function toast(msg, type = 'ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'show ' + type;
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = ''; }, 3000);
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function fmtTime(unix) {
+  if (!unix) return '—';
+  const d = new Date(unix * 1000);
+  return d.toLocaleString('zh-CN', { hour12: false });
+}
+
+function fmtTTL(expiresAt) {
+  if (!expiresAt) return '<span style="color:#a78bfa">∞ forever</span>';
+  const now = Math.floor(Date.now() / 1000);
+  const rem = expiresAt - now;
+  if (rem <= 0) return '<span style="color:#f87171">expired</span>';
+  if (rem < 60)  return `<span style="color:#fbbf24">${rem}s</span>`;
+  if (rem < 3600) return `<span style="color:#fbbf24">${Math.floor(rem/60)}m ${rem%60}s</span>`;
+  return `<span style="color:#34d399">${Math.floor(rem/3600)}h ${Math.floor((rem%3600)/60)}m</span>`;
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+let allKeys = [];
+
+// ── Load stats ─────────────────────────────────────────────────────────────
+async function loadStats() {
+  try {
+    const res = await fetch(API + '/api/cache-stats');
+    if (!res.ok) return;
+    const d = await res.json();
+    const s = d.stats || {};
+    // parse memoryInfo: "total=N active=N expired=N backend=X"
+    const mi = s.memoryInfo || '';
+    const get = (k) => { const m = mi.match(new RegExp(k + '=(\\S+)')); return m ? m[1] : '—'; };
+    document.getElementById('stat-active').textContent  = get('active');
+    document.getElementById('stat-expired').textContent = get('expired');
+    document.getElementById('stat-total').textContent   = get('total');
+    document.getElementById('stat-backend').textContent = s.backend || '—';
+  } catch(e) {}
+}
+
+// ── Load all keys (via /api/cache-keys) ────────────────────────────────────
+async function loadKeys() {
+  try {
+    const res = await fetch(API + '/api/cache-keys');
+    if (!res.ok) { allKeys = []; renderTable(); return; }
+    allKeys = await res.json();
+    renderTable();
+  } catch(e) { allKeys = []; renderTable(); }
+}
+
+function renderTable() {
+  const filter = (document.getElementById('search-key').value || '').toLowerCase();
+  const rows = allKeys.filter(r => !filter || r.key.toLowerCase().includes(filter));
+  const tbody = document.getElementById('keys-tbody');
+  const empty = document.getElementById('keys-empty');
+
+  if (rows.length === 0) {
+    tbody.innerHTML = '';
+    empty.style.display = 'block';
+    return;
+  }
+  empty.style.display = 'none';
+
+  const now = Math.floor(Date.now() / 1000);
+  tbody.innerHTML = rows.map(r => {
+    const isExpired = r.expires_at > 0 && r.expires_at < now;
+    const statusBadge = isExpired
+      ? '<span class="badge badge-exp">expired</span>'
+      : '<span class="badge badge-ok">active</span>';
+    const valPreview = escHtml(r.value.length > 80 ? r.value.slice(0, 80) + '…' : r.value);
+    return `<tr>
+      <td class="key-cell" title="${escHtml(r.key)}">${escHtml(r.key)}</td>
+      <td class="val-cell">${valPreview}</td>
+      <td style="white-space:nowrap;">${fmtTTL(r.expires_at)}<br><span class="mono">${r.expires_at ? fmtTime(r.expires_at) : ''}</span></td>
+      <td class="mono">${fmtTime(r.created_at)}</td>
+      <td>${statusBadge}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-sm" style="background:#1e3a5f;border:1px solid #3b82f6;color:#60a5fa;margin-right:4px;"
+          onclick="showDetail(${JSON.stringify(r.key)})">👁 View</button>
+        <button class="btn btn-sm btn-danger"
+          onclick="deleteKey(${JSON.stringify(r.key)})">🗑</button>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Detail modal ───────────────────────────────────────────────────────────
+function showDetail(key) {
+  const row = allKeys.find(r => r.key === key);
+  if (!row) return;
+  document.getElementById('modal-key-title').textContent = 'Key: ' + key;
+  let pretty = row.value;
+  try { pretty = JSON.stringify(JSON.parse(row.value), null, 2); } catch {}
+  document.getElementById('modal-value-pre').textContent = pretty;
+  const now = Math.floor(Date.now() / 1000);
+  const rem = row.expires_at > 0 ? row.expires_at - now : null;
+  document.getElementById('modal-meta').innerHTML =
+    `Created: ${fmtTime(row.created_at)} &nbsp;|&nbsp; ` +
+    `Expires: ${row.expires_at ? fmtTime(row.expires_at) : '∞ never'} &nbsp;|&nbsp; ` +
+    `Remaining: ${rem !== null ? (rem > 0 ? rem + 's' : 'expired') : '∞'}`;
+  document.getElementById('detail-modal').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('detail-modal').classList.remove('open');
+}
+document.getElementById('detail-modal').addEventListener('click', e => {
+  if (e.target === document.getElementById('detail-modal')) closeModal();
+});
+
+// ── CRUD ───────────────────────────────────────────────────────────────────
+async function doSet() {
+  const key = document.getElementById('f-key').value.trim();
+  const ttl = parseInt(document.getElementById('f-ttl').value) || 0;
+  const raw = document.getElementById('f-value').value.trim();
+  if (!key) { toast('Key is required', 'err'); return; }
+  let data;
+  try { data = JSON.parse(raw || 'null'); } catch { data = raw; }
+  try {
+    const res = await fetch(API + '/api/cache/' + encodeURIComponent(key), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data, ttl }),
+    });
+    const d = await res.json();
+    if (d.success) { toast('✅ Saved: ' + key); loadAll(); }
+    else toast('❌ ' + (d.error || 'Failed'), 'err');
+  } catch(e) { toast('❌ ' + e.message, 'err'); }
+}
+
+async function doGet() {
+  const key = document.getElementById('f-key').value.trim();
+  if (!key) { toast('Key is required', 'err'); return; }
+  try {
+    const res = await fetch(API + '/api/cache/' + encodeURIComponent(key));
+    const d = await res.json();
+    const el = document.getElementById('get-result');
+    const pre = document.getElementById('get-result-pre');
+    el.style.display = 'block';
+    pre.textContent = JSON.stringify(d, null, 2);
+    if (d.cached) toast('✅ Cache hit: ' + key);
+    else toast('⚠️ Cache miss: ' + key, 'err');
+  } catch(e) { toast('❌ ' + e.message, 'err'); }
+}
+
+async function doDelete() {
+  const key = document.getElementById('f-key').value.trim();
+  if (!key) { toast('Key is required', 'err'); return; }
+  await deleteKey(key);
+}
+
+async function deleteKey(key) {
+  try {
+    const res = await fetch(API + '/api/cache/' + encodeURIComponent(key), { method: 'DELETE' });
+    const d = await res.json();
+    if (d.success) { toast('🗑 Deleted: ' + key); loadAll(); }
+    else toast('❌ ' + (d.error || 'Failed'), 'err');
+  } catch(e) { toast('❌ ' + e.message, 'err'); }
+}
+
+// ── Init ───────────────────────────────────────────────────────────────────
+function loadAll() {
+  loadStats();
+  loadKeys();
+}
+
+loadAll();
+setInterval(loadAll, 5000);
+</script>
+</body>
+</html>

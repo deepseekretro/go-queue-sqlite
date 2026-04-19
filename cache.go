@@ -248,6 +248,36 @@ func handleCacheStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// GET /api/cache-keys  — 列出所有缓存项（供 Dashboard 使用）
+type CacheKeyItem struct {
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+	ExpiresAt int64  `json:"expires_at"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func handleCacheKeys(w http.ResponseWriter, r *http.Request) {
+	rows, err := cacheDB.Query(
+		`SELECT key, value, expires_at, created_at FROM cache_items ORDER BY created_at DESC LIMIT 500`,
+	)
+	if err != nil {
+		jsonResp(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+
+	var items []CacheKeyItem
+	for rows.Next() {
+		var it CacheKeyItem
+		rows.Scan(&it.Key, &it.Value, &it.ExpiresAt, &it.CreatedAt)
+		items = append(items, it)
+	}
+	if items == nil {
+		items = []CacheKeyItem{}
+	}
+	jsonResp(w, 200, items)
+}
+
 // cacheRouter 分发 /api/cache/ 和 /api/cache-stats 请求
 func cacheRouter(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
@@ -255,6 +285,12 @@ func cacheRouter(w http.ResponseWriter, r *http.Request) {
 	// GET /api/cache-stats
 	if path == "/api/cache-stats" {
 		handleCacheStats(w, r)
+		return
+	}
+
+	// GET /api/cache-keys
+	if path == "/api/cache-keys" {
+		handleCacheKeys(w, r)
 		return
 	}
 
