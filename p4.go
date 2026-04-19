@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -77,32 +79,52 @@ type JobWithTags struct {
 // handleListJobsWithTags GET /api/jobs — 支持 ?tag=xx 过滤（替换原 handleListJobs）
 func handleListJobsWithTags(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	queue  := q.Get("queue")
-	status := q.Get("status")
-	tag    := q.Get("tag")
-	limit  := "50"
-	if q.Get("limit") != "" {
-		limit = q.Get("limit")
+	queue   := q.Get("queue")
+	status  := q.Get("status")
+	tag     := q.Get("tag")
+	perPage := 20
+	if q.Get("per_page") != "" {
+		if n, err := strconv.Atoi(q.Get("per_page")); err == nil && n > 0 && n <= 200 {
+			perPage = n
+		}
 	}
+	page := 1
+	if q.Get("page") != "" {
+		if n, err := strconv.Atoi(q.Get("page")); err == nil && n > 0 {
+			page = n
+		}
+	}
+	offset := (page - 1) * perPage
 
-	query := `SELECT id,queue,payload,attempts,status,priority,tags,available_at,started_at,finished_at,created_at,updated_at FROM jobs WHERE 1=1`
-	args := []interface{}{}
+	// WHERE 条件（共用）
+	where := " WHERE 1=1"
+	args  := []interface{}{}
 	if queue != "" {
-		query += " AND queue=?"
+		where += " AND queue=?"
 		args = append(args, queue)
 	}
 	if status != "" {
-		query += " AND status=?"
+		where += " AND status=?"
 		args = append(args, status)
 	}
 	if tag != "" {
-		// 匹配逗号分隔列表中的某个 tag（精确匹配）
-		query += " AND (tags=? OR tags LIKE ? OR tags LIKE ? OR tags LIKE ?)"
+		where += " AND (tags=? OR tags LIKE ? OR tags LIKE ? OR tags LIKE ?)"
 		args = append(args, tag, tag+",%", "%,"+tag, "%,"+tag+",%")
 	}
-	query += " ORDER BY id DESC LIMIT " + limit
 
-	rows, err := db.Query(query, args...)
+	// 查询总数
+	var total int
+	countArgs := make([]interface{}, len(args))
+	copy(countArgs, args)
+	if err := db.QueryRow("SELECT COUNT(*) FROM jobs"+where, countArgs...).Scan(&total); err != nil {
+		jsonResp(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// 查询当前页数据
+	dataQuery := `SELECT id,queue,payload,attempts,status,priority,tags,available_at,started_at,finished_at,created_at,updated_at FROM jobs` +
+		where + fmt.Sprintf(" ORDER BY id DESC LIMIT %d OFFSET %d", perPage, offset)
+	rows, err := db.Query(dataQuery, args...)
 	if err != nil {
 		jsonResp(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -118,7 +140,25 @@ func handleListJobsWithTags(w http.ResponseWriter, r *http.Request) {
 		j.Tags = stringToTags(tagsStr)
 		jobs = append(jobs, j)
 	}
-	jsonResp(w, 200, jobs)
+
+	type PagedJobs struct {
+		Jobs    []JobWithTags `json:"jobs"`
+		Total   int           `json:"total"`
+		Page    int           `json:"page"`
+		PerPage int           `json:"per_page"`
+		Pages   int           `json:"pages"`
+	}
+	pages := (total + perPage - 1) / perPage
+	if pages == 0 {
+		pages = 1
+	}
+	jsonResp(w, 200, PagedJobs{
+		Jobs:    jobs,
+		Total:   total,
+		Page:    page,
+		PerPage: perPage,
+		Pages:   pages,
+	})
 }
 
 // handleGetTags GET /api/tags — 列出所有已使用的 tag（去重排序）

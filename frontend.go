@@ -107,6 +107,12 @@ const indexHTML = `<!DOCTYPE html>
   .tab-bar { display: flex; gap: 4px; margin-bottom: 14px; }
   .tab { padding: 6px 14px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #64748b; cursor: pointer; font-size: 0.8rem; }
   .tab.active { background: #1e3a5f; color: #60a5fa; border-color: #3b82f6; }
+
+  /* ── Jobs 分页控件 ─────────────────────────────────────────────────────── */
+  #jobs-pagination { margin-top: 12px; }
+  #jobs-pagination button:disabled { opacity: 0.35; cursor: not-allowed; }
+  #jobs-pagination button { transition: background .15s, border-color .15s; }
+  #jobs-pagination button:not(:disabled):hover { border-color: #6366f1 !important; color: #c7d2fe !important; }
 </style>
 </head>
 <body>
@@ -176,16 +182,13 @@ const indexHTML = `<!DOCTYPE html>
     <div class="filter-bar">
       <div>
         <label>Queue</label>
-        <select id="f-queue" onchange="loadJobs()">
+        <select id="f-queue" onchange="jobsGoPage(1)">
           <option value="">All</option>
-          <option value="default">default</option>
-          <option value="emails">emails</option>
-          <option value="reports">reports</option>
         </select>
       </div>
       <div>
         <label>Status</label>
-        <select id="f-status" onchange="loadJobs()">
+        <select id="f-status" onchange="jobsGoPage(1)">
           <option value="">All</option>
           <option value="pending">pending</option>
           <option value="running">running</option>
@@ -194,12 +197,16 @@ const indexHTML = `<!DOCTYPE html>
         </select>
       </div>
       <div>
-        <label>Limit</label>
-        <input type="number" id="f-limit" value="30" style="width:80px" onchange="loadJobs()">
+        <label>Per Page</label>
+        <select id="f-per-page" onchange="jobsGoPage(1)" style="width:72px">
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+        </select>
       </div>
       <div>
         <label>Tag</label>
-        <input type="text" id="f-tag" placeholder="filter by tag…" style="width:110px" oninput="loadJobs()">
+        <input type="text" id="f-tag" placeholder="filter by tag…" style="width:110px" oninput="jobsGoPage(1)">
       </div>
     </div>
     <div class="table-wrap">
@@ -212,11 +219,20 @@ const indexHTML = `<!DOCTYPE html>
         </tbody>
       </table>
     </div>
+    <div id="jobs-pagination" style="display:flex;align-items:center;justify-content:space-between;margin-top:12px;flex-wrap:wrap;gap:8px;">
+      <span id="jobs-info" style="font-size:.78rem;color:#64748b;"></span>
+      <div style="display:flex;align-items:center;gap:6px;">
+        <button id="jobs-prev" class="btn btn-sm" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;" onclick="jobsGoPage(jobsCurrentPage-1)" disabled>‹ Prev</button>
+        <span id="jobs-pages" style="display:flex;gap:4px;"></span>
+        <button id="jobs-next" class="btn btn-sm" style="background:#1e293b;border:1px solid #334155;color:#94a3b8;" onclick="jobsGoPage(jobsCurrentPage+1)" disabled>Next ›</button>
+      </div>
+    </div>
   </div>
 
 </div>
 
 <div id="toast"></div>
+
 
 <script>
 function escHtml(s) {
@@ -308,32 +324,46 @@ function statusBadge(s) {
   return ` + "`" + `<span class="badge badge-${s}">${s}</span>` + "`" + `;
 }
 
+async let jobsCurrentPage = 1;
+let jobsTotalPages  = 1;
+
+function jobsGoPage(page) {
+  if (page < 1 || page > jobsTotalPages) return;
+  jobsCurrentPage = page;
+  loadJobs();
+}
+
 async function loadJobs() {
-  const queue  = document.getElementById('f-queue').value;
-  const status = document.getElementById('f-status').value;
-  const tag    = document.getElementById('f-tag') ? document.getElementById('f-tag').value : '';
-  const limit  = document.getElementById('f-limit').value || 30;
-  let url = ` + "`" + `/api/jobs?limit=${limit}` + "`" + `;
+  const queue   = document.getElementById('f-queue').value;
+  const status  = document.getElementById('f-status').value;
+  const tag     = document.getElementById('f-tag') ? document.getElementById('f-tag').value : '';
+  const perPage = document.getElementById('f-per-page') ? document.getElementById('f-per-page').value : 20;
+  let url = ` + "`" + `/api/jobs?page=${jobsCurrentPage}&per_page=${perPage}` + "`" + `;
   if (queue)  url += ` + "`" + `&queue=${queue}` + "`" + `;
   if (status) url += ` + "`" + `&status=${status}` + "`" + `;
   if (tag)    url += ` + "`" + `&tag=${encodeURIComponent(tag)}` + "`" + `;
 
-  const res = await fetch(url);
-  const jobs = await res.json();
+  const res  = await fetch(url);
+  const data = await res.json();
   const tbody = document.getElementById('jobs-tbody');
+
+  // 兼容旧格式（数组）和新格式（{jobs, total, page, per_page, pages}）
+  const jobs  = Array.isArray(data) ? data : (data.jobs || []);
+  const total = Array.isArray(data) ? jobs.length : (data.total || 0);
+  const pages = Array.isArray(data) ? 1 : (data.pages || 1);
+  jobsTotalPages = pages;
 
   if (!jobs || jobs.length === 0) {
     tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#64748b;padding:24px">No jobs found</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = jobs.map(j => {
-    const jt = jobTypeBadge(j.payload);
-    const payloadShort = j.payload.length > 80 ? j.payload.slice(0,80)+'…' : j.payload;
-    const tagsHtml = (j.tags && j.tags.length > 0)
-      ? j.tags.map(t => ` + "`" + `<span style="display:inline-block;padding:1px 6px;border-radius:10px;font-size:0.68rem;background:#1e3a5f;color:#93c5fd;border:1px solid #3b82f6;margin:1px;cursor:pointer" onclick="document.getElementById('f-tag').value='${escHtml(t)}';loadJobs()">${escHtml(t)}</span>` + "`" + `).join('')
-      : '<span style="color:#475569">&mdash;</span>';
-    return ` + "`" + `<tr>
+  } else {
+    tbody.innerHTML = jobs.map(j => {
+      const payload = (() => { try { return JSON.parse(j.payload); } catch { return {}; } })();
+      const jt = payload.job_type || payload.type || j.queue;
+      const payloadShort = j.payload.length > 60 ? j.payload.slice(0, 60) + '…' : j.payload;
+      const tagsHtml = j.tags && j.tags.length
+        ? j.tags.map(t => ` + "`" + `<span style="background:#1e3a5f;color:#93c5fd;padding:1px 6px;border-radius:4px;font-size:.72rem;cursor:pointer" onclick="document.getElementById('f-tag').value='${escHtml(t)}';jobsGoPage(1)">${escHtml(t)}</span>` + "`" + `).join('')
+        : '<span style="color:#475569">&mdash;</span>';
+      return ` + "`" + `<tr>
       <td style="color:#a78bfa;font-weight:600">#${j.id}</td>
       <td><code style="color:#fbbf24">${j.queue}</code></td>
       <td><code style="color:#93c5fd">${jt}</code></td>
@@ -344,8 +374,44 @@ async function loadJobs() {
       <td class="ts">${fmtTime(j.created_at)}</td>
       <td class="ts">${fmtTime(j.updated_at)}</td>
     </tr>` + "`" + `;
-  }).join('');
+    }).join('');
+  }
+
+  // 更新分页信息
+  const perPageNum = parseInt(perPage);
+  const from = total === 0 ? 0 : (jobsCurrentPage - 1) * perPageNum + 1;
+  const to   = Math.min(jobsCurrentPage * perPageNum, total);
+  const infoEl = document.getElementById('jobs-info');
+  if (infoEl) infoEl.textContent = total === 0 ? 'No jobs' : ` + "`" + `${from}–${to} of ${total} jobs` + "`" + `;
+
+  // 上一页 / 下一页按钮
+  const prevBtn = document.getElementById('jobs-prev');
+  const nextBtn = document.getElementById('jobs-next');
+  if (prevBtn) prevBtn.disabled = jobsCurrentPage <= 1;
+  if (nextBtn) nextBtn.disabled = jobsCurrentPage >= jobsTotalPages;
+
+  // 页码按钮（最多显示 7 个，超出用省略号）
+  const pagesEl = document.getElementById('jobs-pages');
+  if (pagesEl) {
+    const cur = jobsCurrentPage, tot = jobsTotalPages;
+    let nums = [];
+    if (tot <= 7) {
+      nums = Array.from({length: tot}, (_, i) => i + 1);
+    } else {
+      nums = [1];
+      if (cur > 3) nums.push('…');
+      for (let i = Math.max(2, cur-1); i <= Math.min(tot-1, cur+1); i++) nums.push(i);
+      if (cur < tot - 2) nums.push('…');
+      nums.push(tot);
+    }
+    pagesEl.innerHTML = nums.map(n => {
+      if (n === '…') return '<span style="color:#475569;padding:0 4px">…</span>';
+      const active = n === cur;
+      return ` + "`" + `<button onclick="jobsGoPage(${n})" style="min-width:30px;padding:4px 8px;border-radius:5px;border:1px solid ${active?'#6366f1':'#334155'};background:${active?'#4f46e5':'#1e293b'};color:${active?'#fff':'#94a3b8'};cursor:pointer;font-size:.78rem;">${n}</button>` + "`" + `;
+    }).join('');
+  }
 }
+
 
 async function retryFailed() {
   const res = await fetch('/api/jobs/retry-failed', {method:'POST'});
@@ -389,6 +455,19 @@ async function confirmDBReset() {
   }
 }
 
+async function loadQueuesForFilter() {
+  try {
+    const res = await fetch('/api/queues');
+    const queues = await res.json();
+    const sel = document.getElementById('f-queue');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">All</option>' +
+      queues.map(q => q.name).sort().map(n =>
+        ` + "`" + `<option value="${n}"${n === cur ? ' selected' : ''}>${n}</option>` + "`" + `
+      ).join('');
+  } catch(e) { /* 保持现有选项 */ }
+}
+
 function loadAll() { loadStats(); loadJobs(); }
 
 // SSE 实时推送：stats 变化时自动刷新，无需轮询
@@ -405,6 +484,7 @@ function loadAll() { loadStats(); loadJobs(); }
   setInterval(loadAll, 30000);
 })();
 
+loadQueuesForFilter();
 loadAll();
 
 // ─── 获取当前登录用户名 ─────────────────────────────────────────────────────
