@@ -324,7 +324,7 @@ function statusBadge(s) {
   return ` + "`" + `<span class="badge badge-${s}">${s}</span>` + "`" + `;
 }
 
-async let jobsCurrentPage = 1;
+let jobsCurrentPage = 1;
 let jobsTotalPages  = 1;
 
 function jobsGoPage(page) {
