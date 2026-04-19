@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-rebuild.py — 一键编译、停止旧进程、部署、启动 goapp
+rebuild.py — 一键编译、部署到 /tmp/goapp/、启动 goapp
 用法：python3 rebuild.py [--no-start]
-  --no-start   只编译+替换二进制，不自动启动新进程
+  --no-start   只编译，不自动启动新进程
+
+部署目录：/tmp/goapp/
+  - 二进制：/tmp/goapp/goapp
+  - 数据库：/tmp/goapp/queue.db
+  - 日志：  /tmp/goapp/goapp.log
 
 耗时说明（本环境实测）：
   - 无修改（全缓存）：~16s（纯链接）
@@ -14,14 +19,19 @@ rebuild.py — 一键编译、停止旧进程、部署、启动 goapp
 import os
 import sys
 import time
+import shutil
 import subprocess
 
 # ── 配置 ────────────────────────────────────────────────
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 GO_BIN      = '/tmp/go/bin/go'
-OUTPUT_TMP  = '/tmp/goapp_build_out'
-BINARY      = os.path.join(SCRIPT_DIR, 'goapp')
-LOG_FILE    = os.path.join(SCRIPT_DIR, 'goapp.log')
+
+# 部署目录：全部放在 /tmp/goapp/，不污染源码目录
+DEPLOY_DIR  = '/tmp/goapp'
+BINARY      = os.path.join(DEPLOY_DIR, 'goapp')
+DB_FILE     = os.path.join(DEPLOY_DIR, 'queue.db')
+LOG_FILE    = os.path.join(DEPLOY_DIR, 'goapp.log')
+DB_SEED     = os.path.join(SCRIPT_DIR, 'queue.db')   # 源码目录里的种子 DB（可选）
 
 BUILD_ENV = {
     **os.environ,
@@ -54,11 +64,15 @@ def err(msg):
     print(f'  \033[1;31m✗ {msg}\033[0m')
 
 
-# ── 1. 编译 ──────────────────────────────────────────────
-step('编译 goapp ...')
+# ── 0. 确保部署目录存在 ───────────────────────────────────
+os.makedirs(DEPLOY_DIR, exist_ok=True)
+
+
+# ── 1. 编译（直接输出到 /tmp/goapp/goapp）────────────────
+step(f'编译 goapp → {BINARY} ...')
 t0 = time.time()
 res = subprocess.run(
-    [GO_BIN, 'build', '-v', '-o', OUTPUT_TMP, '.'],
+    [GO_BIN, 'build', '-v', '-o', BINARY, '.'],
     capture_output=True, text=True,
     cwd=SCRIPT_DIR,
     env=BUILD_ENV,
@@ -78,18 +92,20 @@ else:
     ok(f'编译成功（{elapsed:.1f}s）— 全部命中缓存，仅重新链接')
 
 
-# ── 2. 停止旧进程 ─────────────────────────────────────────
+# ── 2. 停止旧 goapp 进程 ─────────────────────────────────────────
 step('停止旧 goapp 进程 ...')
 
-# 先优雅停止
-subprocess.run(['pkill', '-SIGTERM', '-f', r'goapp/goapp'], capture_output=True)
+# 同时覆盖新路径（/tmp/goapp/goapp）和旧路径（.../goapp/goapp）
+for pattern in [r'/tmp/goapp/goapp', r'goapp/goapp']:
+    subprocess.run(['pkill', '-SIGTERM', '-f', pattern], capture_output=True)
 time.sleep(2)
 
-# 检查是否还在
+# 检查是否还有残留（匹配任意 goapp 二进制）
 r = subprocess.run(['pgrep', '-f', r'goapp/goapp'], capture_output=True, text=True)
 if r.stdout.strip():
     print(f'  进程仍在（PID {r.stdout.strip()}），发送 SIGKILL ...')
-    subprocess.run(['pkill', '-9', '-f', r'goapp/goapp'], capture_output=True)
+    for pattern in [r'/tmp/goapp/goapp', r'goapp/goapp']:
+        subprocess.run(['pkill', '-9', '-f', pattern], capture_output=True)
     time.sleep(2)
 
 r = subprocess.run(['pgrep', '-f', r'goapp/goapp'], capture_output=True, text=True)
@@ -100,40 +116,27 @@ if r.stdout.strip():
 ok('旧进程已停止')
 
 
-# ── 3. 替换二进制 ─────────────────────────────────────────
-step(f'替换二进制 → {BINARY}')
-res = subprocess.run(['cp', OUTPUT_TMP, BINARY], capture_output=True, text=True)
-if res.returncode != 0:
-    err(f'cp 失败: {res.stderr.strip()}')
-    sys.exit(1)
-subprocess.run(['chmod', '+x', BINARY], capture_output=True)
-ok(f'二进制已更新')
-
-
-# ── 4. 启动新进程 ─────────────────────────────────────────
+# ── 3. 启动新进程 ─────────────────────────────────────────
 if '--no-start' in sys.argv:
     print('\n  --no-start 模式，跳过启动')
     sys.exit(0)
 
-step(f'启动新 goapp（日志 → {LOG_FILE}）...')
+step(f'启动新 goapp（运行目录: {DEPLOY_DIR}，日志: {LOG_FILE}）...')
 
-# ── DB 冷启动恢复：/tmp/queue.db 不存在时从项目目录拷贝 ──
-DB_TMP  = '/tmp/queue.db'
-DB_SEED = os.path.join(SCRIPT_DIR, 'queue.db')
-if not os.path.exists(DB_TMP):
+# DB 冷启动恢复：queue.db 不存在时从源码目录拷贝种子
+if not os.path.exists(DB_FILE):
     if os.path.exists(DB_SEED):
-        import shutil
-        shutil.copy2(DB_SEED, DB_TMP)
-        ok(f'DB 已从 {DB_SEED} 恢复到 {DB_TMP}')
+        shutil.copy2(DB_SEED, DB_FILE)
+        ok(f'DB 已从种子恢复: {DB_SEED} → {DB_FILE}')
     else:
-        ok(f'DB 不存在，goapp 将自动创建新数据库: {DB_TMP}')
+        ok(f'DB 不存在，goapp 将自动创建新数据库: {DB_FILE}')
 else:
-    ok(f'DB 已存在，直接使用: {DB_TMP}')
+    ok(f'DB 已存在，直接使用: {DB_FILE}')
 
 log_fh = open(LOG_FILE, 'w')
 proc = subprocess.Popen(
-    [BINARY],
-    cwd=SCRIPT_DIR,
+    [BINARY, '-db', DB_FILE],
+    cwd=DEPLOY_DIR,
     env=RUN_ENV,
     stdout=log_fh,
     stderr=subprocess.STDOUT,
@@ -155,4 +158,4 @@ time.sleep(1)
 log_fh.flush()
 r = subprocess.run(['tail', '-20', LOG_FILE], capture_output=True, text=True)
 print('\n\033[90m' + r.stdout + '\033[0m')
-print(f'\033[1;32m🚀 部署完成！\033[0m  PID={proc.pid}  日志: {LOG_FILE}\n')
+print(f'\033[1;32m🚀 部署完成！\033[0m  PID={proc.pid}  运行目录: {DEPLOY_DIR}  日志: {LOG_FILE}\n')
