@@ -86,7 +86,7 @@ td { padding: 9px 12px; border-bottom: 1px solid #1e293b; vertical-align: top; }
 tr:hover td { background: #1a2744; }
 .mono { font-family: monospace; font-size: .78rem; color: #94a3b8; }
 .key-cell { color: #fbbf24; font-family: monospace; font-size: .82rem; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.val-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #94a3b8; font-family: monospace; font-size: .75rem; }
+.val-cell { max-width: 320px; color: #94a3b8; font-family: monospace; font-size: .75rem; white-space: pre-wrap; word-break: break-all; }
 .badge {
   display: inline-block; padding: 2px 8px;
   border-radius: 9999px; font-size: .7rem; font-weight: 600;
@@ -112,7 +112,7 @@ tr:hover td { background: #1a2744; }
   background: rgba(0,0,0,.6); z-index: 1000;
   align-items: center; justify-content: center;
 }
-#detail-modal.open { display: flex; }
+#detail-modal.open { display: flex !important; }
 .modal-box {
   background: #1e293b; border: 1px solid #334155;
   border-radius: 12px; padding: 24px;
@@ -232,6 +232,13 @@ tr:hover td { background: #1a2744; }
     <h3 id="modal-key-title">Key: —</h3>
     <pre id="modal-value-pre"></pre>
     <div style="margin-top:12px;font-size:.75rem;color:#64748b;" id="modal-meta"></div>
+    <div style="margin-top:14px;display:flex;gap:8px;">
+      <button class="btn btn-sm" style="background:#1e3a5f;border:1px solid #3b82f6;color:#60a5fa;"
+        onclick="copyModalValue()">📋 Copy Value</button>
+      <button class="btn btn-sm" style="background:#1c3a2a;border:1px solid #16a34a;color:#86efac;"
+        onclick="fillEditForm()">✏️ Fill Edit Form</button>
+      <button class="btn btn-sm btn-danger" onclick="deleteFromModal()">🗑 Delete</button>
+    </div>
   </div>
 </div>
 
@@ -319,7 +326,14 @@ function renderTable() {
     const statusBadge = isExpired
       ? '<span class="badge badge-exp">expired</span>'
       : '<span class="badge badge-ok">active</span>';
-    const valPreview = escHtml(r.value.length > 80 ? r.value.slice(0, 80) + '…' : r.value);
+    // 表格里展示完整 value（val-cell 已设 pre-wrap，超长内容自动换行）
+    let valPreview;
+    try {
+      const parsed = JSON.parse(r.value);
+      valPreview = escHtml(JSON.stringify(parsed, null, 2));
+    } catch {
+      valPreview = escHtml(r.value);
+    }
     return `<tr>
       <td class="key-cell" title="${escHtml(r.key)}">${escHtml(r.key)}</td>
       <td class="val-cell">${valPreview}</td>
@@ -350,11 +364,40 @@ function showDetail(key) {
     `Created: ${fmtTime(row.created_at)} &nbsp;|&nbsp; ` +
     `Expires: ${row.expires_at ? fmtTime(row.expires_at) : '∞ never'} &nbsp;|&nbsp; ` +
     `Remaining: ${rem !== null ? (rem > 0 ? rem + 's' : 'expired') : '∞'}`;
+  // 同步 key 到操作面板，方便直接编辑/删除
+  const fKey = document.getElementById('f-key');
+  if (fKey) fKey.value = key;
   document.getElementById('detail-modal').classList.add('open');
 }
 
 function closeModal() {
   document.getElementById('detail-modal').classList.remove('open');
+}
+
+function copyModalValue() {
+  const text = document.getElementById('modal-value-pre').textContent;
+  navigator.clipboard.writeText(text).then(() => toast('📋 Copied!')).catch(() => {
+    // fallback
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+    toast('📋 Copied!');
+  });
+}
+
+function fillEditForm() {
+  const key = document.getElementById('modal-key-title').textContent.replace(/^Key: /, '');
+  const raw = document.getElementById('modal-value-pre').textContent;
+  document.getElementById('f-key').value = key;
+  document.getElementById('f-value').value = raw;
+  closeModal();
+  toast('✏️ Filled edit form for: ' + key);
+}
+
+function deleteFromModal() {
+  const key = document.getElementById('modal-key-title').textContent.replace(/^Key: /, '');
+  closeModal();
+  deleteKey(key);
 }
 document.getElementById('detail-modal').addEventListener('click', e => {
   if (e.target === document.getElementById('detail-modal')) closeModal();
