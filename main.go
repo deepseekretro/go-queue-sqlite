@@ -1290,10 +1290,9 @@ func isSystemIdle() bool {
 	return true
 }
 
-// dbFilePath 返回当前 DB 文件路径（从连接字符串解析）
+// dbFilePath 返回当前 DB 文件路径
 func dbFilePath() string {
-	// 连接字符串格式：./queue.db?...
-	return "./queue.db"
+	return "/tmp/queue.db"
 }
 
 // dbFileSize 返回 DB 的逻辑大小（page_count × page_size，字节）。

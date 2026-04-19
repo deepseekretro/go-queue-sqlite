@@ -116,6 +116,20 @@ if '--no-start' in sys.argv:
     sys.exit(0)
 
 step(f'启动新 goapp（日志 → {LOG_FILE}）...')
+
+# ── DB 冷启动恢复：/tmp/queue.db 不存在时从项目目录拷贝 ──
+DB_TMP  = '/tmp/queue.db'
+DB_SEED = os.path.join(SCRIPT_DIR, 'queue.db')
+if not os.path.exists(DB_TMP):
+    if os.path.exists(DB_SEED):
+        import shutil
+        shutil.copy2(DB_SEED, DB_TMP)
+        ok(f'DB 已从 {DB_SEED} 恢复到 {DB_TMP}')
+    else:
+        ok(f'DB 不存在，goapp 将自动创建新数据库: {DB_TMP}')
+else:
+    ok(f'DB 已存在，直接使用: {DB_TMP}')
+
 log_fh = open(LOG_FILE, 'w')
 proc = subprocess.Popen(
     [BINARY],
