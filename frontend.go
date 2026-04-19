@@ -121,6 +121,18 @@ const indexHTML = `<!DOCTYPE html>
     outline: none; border-color: #6366f1; box-shadow: 0 0 0 2px rgba(99,102,241,.25);
   }
   #cron-logs-modal .table-wrap { border-radius: 6px; overflow: hidden; }
+
+  /* ── Batches / Rate Limits / AutoScale / System 面板 ──────────────────────── */
+  #batches-panel .table-wrap table td:nth-child(4) { min-width: 160px; }
+  #rate-limits-panel .table-wrap table td:nth-child(3) { min-width: 140px; }
+  #autoscale-panel .table-wrap table td:nth-child(2) { min-width: 100px; }
+  #system-panel { }
+  #cron-modal input:focus, #cron-modal textarea:focus,
+  #rate-limit-modal input:focus,
+  #autoscale-modal input:focus {
+    outline: none; border-color: #6366f1 !important;
+    box-shadow: 0 0 0 2px rgba(99,102,241,.2);
+  }
 </style>
 </head>
 <body>
@@ -346,6 +358,223 @@ const indexHTML = `<!DOCTYPE html>
             <tr><td colspan="5" style="text-align:center;color:#64748b;padding:16px">Loading...</td></tr>
           </tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Batches panel -->
+  <div class="panel" id="batches-panel">
+    <h2>&#128230; Batches</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>Name</th><th>Status</th><th>Progress</th>
+            <th style="text-align:center">Total</th>
+            <th style="text-align:center">Done</th>
+            <th style="text-align:center">Failed</th>
+            <th style="text-align:center">Pending</th>
+            <th>Created</th><th>Finished</th><th>Callbacks</th>
+          </tr>
+        </thead>
+        <tbody id="batches-tbody">
+          <tr><td colspan="11" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+
+  <!-- Rate Limits panel -->
+  <div class="panel" id="rate-limits-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h2 style="margin:0;">&#9889; Rate Limits</h2>
+      <button class="btn" onclick="openRateLimitModal()"
+        style="background:#0f766e;border:1px solid #14b8a6;color:#fff;padding:6px 14px;border-radius:6px;font-size:.82rem;cursor:pointer;">
+        &#43; Set Limit
+      </button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Job Type</th>
+            <th style="text-align:center">Max / Min</th>
+            <th style="text-align:center">Current Count</th>
+            <th style="text-align:center">Window Reset</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rate-limits-tbody">
+          <tr><td colspan="5" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Rate Limit Modal -->
+  <div id="rate-limit-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:28px 32px;width:380px;max-width:95vw;position:relative;">
+      <h3 style="margin:0 0 20px;color:#e2e8f0;font-size:1.05rem;">Set Rate Limit</h3>
+      <form id="rate-limit-form" onsubmit="submitRateLimitForm(event)">
+        <div style="margin-bottom:14px;">
+          <label style="font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;">Job Type <span style="color:#ef4444">*</span></label>
+          <input id="rl-job-type" type="text" placeholder="send_email" style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:.85rem;">
+        </div>
+        <div style="margin-bottom:20px;">
+          <label style="font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;">Max per Minute <span style="color:#ef4444">*</span></label>
+          <input id="rl-max-per-min" type="number" min="1" placeholder="60" style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:.85rem;">
+        </div>
+        <div style="display:flex;gap:10px;justify-content:flex-end;">
+          <button type="button" onclick="closeRateLimitModal()"
+            style="background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:7px 18px;border-radius:6px;cursor:pointer;font-size:.85rem;">
+            Cancel
+          </button>
+          <button type="submit"
+            style="background:#0f766e;border:1px solid #14b8a6;color:#fff;padding:7px 18px;border-radius:6px;cursor:pointer;font-size:.85rem;">
+            Save
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+
+  <!-- AutoScale panel -->
+  <div class="panel" id="autoscale-panel">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+      <h2 style="margin:0;">&#128260; AutoScale Pools</h2>
+      <button class="btn" onclick="openAutoScaleModal(null)"
+        style="background:#7c3aed;border:1px solid #8b5cf6;color:#fff;padding:6px 14px;border-radius:6px;font-size:.82rem;cursor:pointer;">
+        &#43; New Pool
+      </button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Queue</th>
+            <th style="text-align:center">Current</th>
+            <th style="text-align:center">Min</th>
+            <th style="text-align:center">Max</th>
+            <th style="text-align:center">Scale Up At</th>
+            <th style="text-align:center">Scale Down At</th>
+            <th style="text-align:center">Pending Jobs</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="autoscale-tbody">
+          <tr><td colspan="8" style="text-align:center;color:#64748b;padding:24px">Loading...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- AutoScale Modal -->
+  <div id="autoscale-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:28px 32px;width:440px;max-width:95vw;position:relative;">
+      <h3 id="autoscale-modal-title" style="margin:0 0 20px;color:#e2e8f0;font-size:1.05rem;">New AutoScale Pool</h3>
+      <form id="autoscale-form" onsubmit="submitAutoScaleForm(event)">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+          <div style="grid-column:1/-1;">
+            <label style="font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;">Queue <span style="color:#ef4444">*</span></label>
+            <input id="as-queue" type="text" placeholder="default" style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:.85rem;">
+          </div>
+          <div>
+            <label style="font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;">Min Workers</label>
+            <input id="as-min" type="number" min="0" value="1" style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:.85rem;">
+          </div>
+          <div>
+            <label style="font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;">Max Workers</label>
+            <input id="as-max" type="number" min="1" value="10" style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:.85rem;">
+          </div>
+          <div>
+            <label style="font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;">Scale Up At (pending)</label>
+            <input id="as-scale-up" type="number" min="1" value="5" style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:.85rem;">
+          </div>
+          <div>
+            <label style="font-size:.78rem;color:#94a3b8;display:block;margin-bottom:4px;">Scale Down At (pending)</label>
+            <input id="as-scale-down" type="number" min="0" value="1" style="width:100%;background:#0f172a;border:1px solid #334155;color:#e2e8f0;padding:7px 10px;border-radius:6px;font-size:.85rem;">
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;margin-top:20px;justify-content:flex-end;">
+          <button type="button" onclick="closeAutoScaleModal()"
+            style="background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:7px 18px;border-radius:6px;cursor:pointer;font-size:.85rem;">
+            Cancel
+          </button>
+          <button type="submit" id="as-submit-btn"
+            style="background:#7c3aed;border:1px solid #8b5cf6;color:#fff;padding:7px 18px;border-radius:6px;cursor:pointer;font-size:.85rem;">
+            Start Pool
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+
+  <!-- System panel -->
+  <div class="panel" id="system-panel">
+    <h2>&#128451; System</h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:20px;">
+      <div style="background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:14px;">
+        <div style="font-size:.72rem;color:#64748b;margin-bottom:4px;">AVG DURATION</div>
+        <div id="sys-avg-dur" style="font-size:1.3rem;font-weight:700;color:#60a5fa;">—</div>
+      </div>
+      <div style="background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:14px;">
+        <div style="font-size:.72rem;color:#64748b;margin-bottom:4px;">FAILED JOBS (DLQ)</div>
+        <div id="sys-failed-dlq" style="font-size:1.3rem;font-weight:700;color:#f87171;">—</div>
+      </div>
+      <div style="background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:14px;">
+        <div style="font-size:.72rem;color:#64748b;margin-bottom:4px;">DB SIZE</div>
+        <div id="sys-db-size" style="font-size:1.3rem;font-weight:700;color:#a78bfa;">—</div>
+      </div>
+      <div style="background:#0f172a;border:1px solid #1e3a5f;border-radius:8px;padding:14px;">
+        <div style="font-size:.72rem;color:#64748b;margin-bottom:4px;">VERSION</div>
+        <div id="sys-version" style="font-size:1.3rem;font-weight:700;color:#34d399;">—</div>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+      <!-- Vacuum -->
+      <div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <span style="font-size:.85rem;font-weight:600;color:#e2e8f0;">&#9881; Vacuum</span>
+          <button id="vacuum-btn" onclick="triggerVacuum(this)"
+            style="background:#1e3a5f;border:1px solid #3b82f6;color:#60a5fa;padding:4px 12px;border-radius:5px;font-size:.78rem;cursor:pointer;">
+            Run Now
+          </button>
+        </div>
+        <div style="font-size:.78rem;color:#64748b;line-height:1.8;">
+          <div>Status: <span id="vac-status" style="color:#94a3b8">—</span></div>
+          <div>Last Run: <span id="vac-last-run" style="color:#94a3b8">—</span></div>
+          <div>Duration: <span id="vac-dur" style="color:#94a3b8">—</span></div>
+          <div>Size Before: <span id="vac-before" style="color:#94a3b8">—</span></div>
+          <div>Size After: <span id="vac-after" style="color:#94a3b8">—</span></div>
+        </div>
+      </div>
+
+      <!-- Backend -->
+      <div style="background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;">
+        <div style="font-size:.85rem;font-weight:600;color:#e2e8f0;margin-bottom:12px;">&#128202; Backend</div>
+        <div style="font-size:.78rem;color:#64748b;line-height:1.8;">
+          <div>Backend: <span id="be-name" style="color:#94a3b8">—</span></div>
+          <div>DB Path: <span id="be-path" style="color:#94a3b8;font-family:monospace;font-size:.72rem;">—</span></div>
+          <div>Tables: <span id="be-tables" style="color:#94a3b8">—</span></div>
+          <div>
+            <a href="/metrics" target="_blank"
+              style="color:#60a5fa;font-size:.78rem;text-decoration:none;">
+              &#128200; Prometheus Metrics &#8599;
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Queue Pending Distribution -->
+    <div style="margin-top:16px;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:16px;">
+      <div style="font-size:.85rem;font-weight:600;color:#e2e8f0;margin-bottom:12px;">&#128202; Queue Pending Distribution</div>
+      <div id="queue-pending-bars" style="display:flex;flex-direction:column;gap:8px;">
+        <span style="color:#64748b;font-size:.78rem;">Loading...</span>
       </div>
     </div>
   </div>
@@ -576,6 +805,347 @@ async function confirmDBReset() {
   }
 }
 
+
+
+// ─── Batches ──────────────────────────────────────────────────────────────────
+
+async function loadBatches() {
+  const res = await fetch('/api/batches');
+  if (!res.ok) return;
+  const batches = await res.json();
+  const tbody = document.getElementById('batches-tbody');
+  if (!batches || batches.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="11" style="text-align:center;color:#64748b;padding:24px">No batches found.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = batches.map(b => {
+    const pct = b.total > 0 ? Math.round((b.done / b.total) * 100) : 0;
+    const barColor = b.status === 'failed' ? '#ef4444'
+                   : b.status === 'done'   ? '#22c55e'
+                   : '#3b82f6';
+    const progressBar = ` + "`" + `<div style="background:#1e293b;border-radius:4px;height:8px;width:120px;overflow:hidden;display:inline-block;vertical-align:middle;">
+      <div style="background:${barColor};height:100%;width:${pct}%;transition:width .3s;"></div>
+    </div> <span style="font-size:.75rem;color:#94a3b8;margin-left:4px;">${pct}%</span>` + "`" + `;
+
+    const statusColors = {
+      pending: 'background:#1e3a5f;color:#60a5fa;border:1px solid #3b82f6;',
+      running: 'background:#1c3a2e;color:#34d399;border:1px solid #059669;',
+      done:    'background:#14532d;color:#86efac;border:1px solid #22c55e;',
+      failed:  'background:#450a0a;color:#fca5a5;border:1px solid #ef4444;',
+    };
+    const sc = statusColors[b.status] || 'background:#1e293b;color:#94a3b8;border:1px solid #334155;';
+    const statusBadgeHtml = ` + "`" + `<span class="badge" style="${sc}">${b.status}</span>` + "`" + `;
+
+    const nameHtml = b.name
+      ? ` + "`" + `<span style="color:#e2e8f0">${escHtml(b.name)}</span>` + "`" + `
+      : ` + "`" + `<span style="color:#475569;font-style:italic">—</span>` + "`" + `;
+
+    // Callbacks
+    const cbs = [];
+    if (b.then_job)    cbs.push(` + "`" + `<span style="font-size:.7rem;background:#1e3a5f;color:#93c5fd;padding:1px 5px;border-radius:4px;border:1px solid #3b82f6;" title="${escHtml(b.then_job)}">then</span>` + "`" + `);
+    if (b.catch_job)   cbs.push(` + "`" + `<span style="font-size:.7rem;background:#450a0a;color:#fca5a5;padding:1px 5px;border-radius:4px;border:1px solid #ef4444;" title="${escHtml(b.catch_job)}">catch</span>` + "`" + `);
+    if (b.finally_job) cbs.push(` + "`" + `<span style="font-size:.7rem;background:#1e293b;color:#94a3b8;padding:1px 5px;border-radius:4px;border:1px solid #334155;" title="${escHtml(b.finally_job)}">finally</span>` + "`" + `);
+    const cbHtml = cbs.length ? cbs.join(' ') : '<span style="color:#475569">—</span>';
+
+    const finished = b.finished_at ? fmtTime(b.finished_at) : '<span style="color:#475569">—</span>';
+
+    return ` + "`" + `<tr>
+      <td style="color:#a78bfa;font-weight:600">#${b.id}</td>
+      <td>${nameHtml}</td>
+      <td>${statusBadgeHtml}</td>
+      <td>${progressBar}</td>
+      <td style="text-align:center;color:#94a3b8">${b.total}</td>
+      <td style="text-align:center;color:#34d399">${b.done}</td>
+      <td style="text-align:center;color:#f87171">${b.failed}</td>
+      <td style="text-align:center;color:#fbbf24">${b.pending}</td>
+      <td class="ts">${fmtTime(b.created_at)}</td>
+      <td class="ts">${finished}</td>
+      <td>${cbHtml}</td>
+    </tr>` + "`" + `;
+  }).join('');
+}
+
+
+// ─── Rate Limits ──────────────────────────────────────────────────────────────
+
+async function loadRateLimits() {
+  const res = await fetch('/api/rate-limits');
+  if (!res.ok) return;
+  const data = await res.json();
+  const tbody = document.getElementById('rate-limits-tbody');
+  const entries = Object.entries(data || {});
+  if (entries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#64748b;padding:24px">No rate limits configured. Click \"+ Set Limit\" to add one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = entries.map(([jobType, info]) => {
+    const pct = info.max_per_min > 0 ? Math.round((info.used_per_min / info.max_per_min) * 100) : 0;
+    const barColor = pct >= 90 ? '#ef4444' : pct >= 60 ? '#f59e0b' : '#22c55e';
+    const usageBar = ` + "`" + `<div style="background:#1e293b;border-radius:4px;height:6px;width:80px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:6px;">
+      <div style="background:${barColor};height:100%;width:${pct}%;transition:width .3s;"></div>
+    </div><span style="font-size:.75rem;color:#94a3b8">${info.used_per_min}/${info.max_per_min}</span>` + "`" + `;
+    const remaining = info.remaining >= 0 ? info.remaining : 0;
+    const remColor = remaining === 0 ? '#ef4444' : remaining < info.max_per_min * 0.2 ? '#f59e0b' : '#34d399';
+    return ` + "`" + `<tr>
+      <td><code style="color:#93c5fd">${escHtml(jobType)}</code></td>
+      <td style="text-align:center;color:#e2e8f0;font-weight:600">${info.max_per_min}</td>
+      <td style="text-align:center">${usageBar}</td>
+      <td style="text-align:center;color:${remColor};font-weight:600">${remaining}</td>
+      <td>
+        <button onclick="editRateLimit('${escHtml(jobType)}',${info.max_per_min})"
+          style="background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:3px 9px;border-radius:5px;font-size:.75rem;cursor:pointer;margin-right:4px;"
+          title="Edit">&#9998;</button>
+        <button onclick="deleteRateLimit('${escHtml(jobType)}',this)"
+          style="background:#2d1515;border:1px solid #7f1d1d;color:#f87171;padding:3px 9px;border-radius:5px;font-size:.75rem;cursor:pointer;"
+          title="Remove">&#128465;</button>
+      </td>
+    </tr>` + "`" + `;
+  }).join('');
+}
+
+function openRateLimitModal(jobType, maxPerMin) {
+  document.getElementById('rl-job-type').value = jobType || '';
+  document.getElementById('rl-max-per-min').value = maxPerMin || '';
+  document.getElementById('rl-job-type').readOnly = !!jobType;
+  document.getElementById('rate-limit-modal').style.display = 'flex';
+}
+
+function editRateLimit(jobType, maxPerMin) {
+  openRateLimitModal(jobType, maxPerMin);
+}
+
+function closeRateLimitModal() {
+  document.getElementById('rate-limit-modal').style.display = 'none';
+  document.getElementById('rl-job-type').readOnly = false;
+}
+
+async function submitRateLimitForm(e) {
+  e.preventDefault();
+  const jobType   = document.getElementById('rl-job-type').value.trim();
+  const maxPerMin = parseInt(document.getElementById('rl-max-per-min').value);
+  if (!jobType)        { toast('❌ Job Type is required', 'err'); return; }
+  if (!maxPerMin || maxPerMin < 1) { toast('❌ Max per Minute must be ≥ 1', 'err'); return; }
+
+  const res = await fetch('/api/rate-limits', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({job_type: jobType, max_per_min: maxPerMin})
+  });
+  const d = await res.json();
+  if (res.ok) {
+    toast(` + "`" + `✅ Rate limit set: ${jobType} → ${maxPerMin}/min` + "`" + `);
+    closeRateLimitModal();
+    loadRateLimits();
+  } else {
+    toast('❌ ' + (d.error || 'Failed'), 'err');
+  }
+}
+
+async function deleteRateLimit(jobType, btn) {
+  if (!confirm(` + "`" + `Remove rate limit for "${jobType}"?` + "`" + `)) return;
+  btn.disabled = true;
+  const res = await fetch(` + "`" + `/api/rate-limits?job_type=${encodeURIComponent(jobType)}` + "`" + `, {method: 'DELETE'});
+  if (res.ok) {
+    toast(` + "`" + `🗑 Rate limit removed: ${jobType}` + "`" + `);
+    loadRateLimits();
+  } else {
+    const d = await res.json();
+    toast('❌ ' + (d.error || 'Failed'), 'err');
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('rate-limit-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeRateLimitModal();
+});
+
+
+// ─── AutoScale ────────────────────────────────────────────────────────────────
+
+async function loadAutoScale() {
+  const res = await fetch('/api/autoscale');
+  if (!res.ok) return;
+  const data = await res.json();
+  const pools = data.pools || [];
+  const tbody = document.getElementById('autoscale-tbody');
+  if (!pools || pools.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#64748b;padding:24px">No autoscale pools running. Click \"+ New Pool\" to start one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = pools.map(p => {
+    const utilPct = p.max_workers > 0 ? Math.round((p.current / p.max_workers) * 100) : 0;
+    const barColor = utilPct >= 90 ? '#ef4444' : utilPct >= 60 ? '#f59e0b' : '#22c55e';
+    const workerBar = ` + "`" + `<div style="background:#1e293b;border-radius:4px;height:6px;width:60px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:4px;">
+      <div style="background:${barColor};height:100%;width:${utilPct}%;transition:width .3s;"></div>
+    </div><span style="font-size:.8rem;color:#e2e8f0;font-weight:600">${p.current}</span>` + "`" + `;
+    const pendingColor = p.pending >= p.scale_up_at ? '#f87171' : p.pending <= p.scale_down_at ? '#34d399' : '#fbbf24';
+    return ` + "`" + `<tr>
+      <td><code style="color:#fbbf24">${escHtml(p.queue)}</code></td>
+      <td style="text-align:center">${workerBar}</td>
+      <td style="text-align:center;color:#94a3b8">${p.min_workers}</td>
+      <td style="text-align:center;color:#94a3b8">${p.max_workers}</td>
+      <td style="text-align:center;color:#60a5fa">${p.scale_up_at}</td>
+      <td style="text-align:center;color:#a78bfa">${p.scale_down_at}</td>
+      <td style="text-align:center;color:${pendingColor};font-weight:600">${p.pending}</td>
+      <td>
+        <button onclick="openAutoScaleModal('${escHtml(p.queue)}',${p.min_workers},${p.max_workers},${p.scale_up_at},${p.scale_down_at})"
+          style="background:#1e293b;border:1px solid #334155;color:#94a3b8;padding:3px 9px;border-radius:5px;font-size:.75rem;cursor:pointer;"
+          title="Edit config">&#9998;</button>
+      </td>
+    </tr>` + "`" + `;
+  }).join('');
+}
+
+function openAutoScaleModal(queue, minW, maxW, scaleUp, scaleDown) {
+  document.getElementById('autoscale-modal-title').textContent = queue ? ` + "`" + `Update Pool: ${queue}` + "`" + ` : 'New AutoScale Pool';
+  document.getElementById('as-submit-btn').textContent = queue ? 'Update' : 'Start Pool';
+  document.getElementById('as-queue').value = queue || '';
+  document.getElementById('as-queue').readOnly = !!queue;
+  document.getElementById('as-min').value = minW != null ? minW : 1;
+  document.getElementById('as-max').value = maxW != null ? maxW : 10;
+  document.getElementById('as-scale-up').value = scaleUp != null ? scaleUp : 5;
+  document.getElementById('as-scale-down').value = scaleDown != null ? scaleDown : 1;
+  document.getElementById('autoscale-modal').style.display = 'flex';
+}
+
+function closeAutoScaleModal() {
+  document.getElementById('autoscale-modal').style.display = 'none';
+  document.getElementById('as-queue').readOnly = false;
+}
+
+async function submitAutoScaleForm(e) {
+  e.preventDefault();
+  const btn = document.getElementById('as-submit-btn');
+  btn.disabled = true;
+  btn.textContent = '…';
+
+  const queue     = document.getElementById('as-queue').value.trim();
+  const minW      = parseInt(document.getElementById('as-min').value) || 1;
+  const maxW      = parseInt(document.getElementById('as-max').value) || 10;
+  const scaleUp   = parseInt(document.getElementById('as-scale-up').value) || 5;
+  const scaleDown = parseInt(document.getElementById('as-scale-down').value) || 1;
+
+  if (!queue) { toast('❌ Queue is required', 'err'); btn.disabled=false; btn.textContent='Start Pool'; return; }
+
+  const res = await fetch('/api/autoscale', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({queue, min_workers: minW, max_workers: maxW, scale_up_at: scaleUp, scale_down_at: scaleDown})
+  });
+  const d = await res.json();
+  if (res.ok) {
+    toast(` + "`" + `✅ ${d.message || 'AutoScale pool updated'}` + "`" + `);
+    closeAutoScaleModal();
+    loadAutoScale();
+  } else {
+    toast('❌ ' + (d.error || 'Failed'), 'err');
+  }
+  btn.disabled = false;
+  btn.textContent = document.getElementById('as-queue').readOnly ? 'Update' : 'Start Pool';
+}
+
+document.getElementById('autoscale-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeAutoScaleModal();
+});
+
+
+// ─── System ───────────────────────────────────────────────────────────────────
+
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  const units = ['B','KB','MB','GB'];
+  let i = 0;
+  while (b >= 1024 && i < units.length - 1) { b /= 1024; i++; }
+  return b.toFixed(i === 0 ? 0 : 1) + ' ' + units[i];
+}
+
+async function loadSystem() {
+  // 从 /api/stats 获取补充数据
+  try {
+    const res = await fetch('/api/stats');
+    if (res.ok) {
+      const s = await res.json();
+      const avgEl = document.getElementById('sys-avg-dur');
+      if (avgEl) avgEl.textContent = s.avg_duration_ms ? s.avg_duration_ms + ' ms' : '—';
+      const dlqEl = document.getElementById('sys-failed-dlq');
+      if (dlqEl) dlqEl.textContent = s.failed_jobs_table ?? '—';
+      const verEl = document.getElementById('sys-version');
+      if (verEl) verEl.textContent = s.version || '—';
+
+      // Vacuum 状态
+      const vac = s.vacuum || {};
+      const vacStatus = document.getElementById('vac-status');
+      if (vacStatus) vacStatus.textContent = vac.running ? '⚙ Running…' : 'Idle';
+      if (vacStatus) vacStatus.style.color = vac.running ? '#fbbf24' : '#34d399';
+      const vacLastRun = document.getElementById('vac-last-run');
+      if (vacLastRun) vacLastRun.textContent = vac.last_run_at ? fmtTime(vac.last_run_at) : 'Never';
+      const vacDur = document.getElementById('vac-dur');
+      if (vacDur) vacDur.textContent = vac.last_dur_ms ? vac.last_dur_ms + ' ms' : '—';
+      const vacBefore = document.getElementById('vac-before');
+      if (vacBefore) vacBefore.textContent = vac.last_size_before ? fmtBytes(vac.last_size_before) : '—';
+      const vacAfter = document.getElementById('vac-after');
+      if (vacAfter) vacAfter.textContent = vac.last_size_after ? fmtBytes(vac.last_size_after) : '—';
+      const dbSizeEl = document.getElementById('sys-db-size');
+      if (dbSizeEl) dbSizeEl.textContent = vac.db_size_now ? fmtBytes(vac.db_size_now) : '—';
+
+      // Queue Pending Distribution
+      const qp = s.queue_pending || {};
+      const barsEl = document.getElementById('queue-pending-bars');
+      if (barsEl) {
+        const entries = Object.entries(qp);
+        if (entries.length === 0) {
+          barsEl.innerHTML = '<span style="color:#475569;font-size:.78rem;">No pending jobs</span>';
+        } else {
+          const maxVal = Math.max(...entries.map(([,v]) => v), 1);
+          barsEl.innerHTML = entries.map(([q, cnt]) => {
+            const pct = Math.round((cnt / maxVal) * 100);
+            return ` + "`" + `<div style="display:flex;align-items:center;gap:10px;">
+              <span style="font-size:.78rem;color:#fbbf24;font-family:monospace;min-width:80px;">${escHtml(q)}</span>
+              <div style="flex:1;background:#1e293b;border-radius:4px;height:8px;overflow:hidden;">
+                <div style="background:#3b82f6;height:100%;width:${pct}%;transition:width .3s;"></div>
+              </div>
+              <span style="font-size:.78rem;color:#94a3b8;min-width:40px;text-align:right;">${cnt}</span>
+            </div>` + "`" + `;
+          }).join('');
+        }
+      }
+    }
+  } catch(e) { /* ignore */ }
+
+  // 从 /api/backend 获取 Backend 信息
+  try {
+    const res2 = await fetch('/api/backend');
+    if (res2.ok) {
+      const be = await res2.json();
+      const beNameEl = document.getElementById('be-name');
+      if (beNameEl) beNameEl.textContent = be.backend || '—';
+      const stats = be.stats || {};
+      const bePathEl = document.getElementById('be-path');
+      if (bePathEl) bePathEl.textContent = stats.path || stats.dsn || '—';
+      const beTablesEl = document.getElementById('be-tables');
+      if (beTablesEl) beTablesEl.textContent = stats.tables ? stats.tables.join(', ') : '—';
+    }
+  } catch(e) { /* ignore */ }
+}
+
+async function triggerVacuum(btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    const res = await fetch('/api/admin/vacuum', {method: 'POST'});
+    const d = await res.json();
+    if (res.ok) {
+      toast('✅ Vacuum started');
+      setTimeout(loadSystem, 2000);
+    } else {
+      toast('❌ ' + (d.error || 'Failed'), 'err');
+    }
+  } catch(e) {
+    toast('❌ ' + e.message, 'err');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Run Now';
+}
 
 // ─── Cron Jobs ────────────────────────────────────────────────────────────────
 
@@ -857,7 +1427,7 @@ async function loadQueuesForFilter() {
   } catch(e) { /* 保持现有选项 */ }
 }
 
-function loadAll() { loadStats(); loadJobs(); loadCrons(); }
+function loadAll() { loadStats(); loadJobs(); loadCrons(); loadBatches(); loadRateLimits(); loadAutoScale(); loadSystem(); }
 
 // SSE 实时推送：stats 变化时自动刷新，无需轮询
 (function initSSE() {
