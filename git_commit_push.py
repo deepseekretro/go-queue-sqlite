@@ -10,6 +10,7 @@ git_commit_push.py — 一键 git add / commit / push 脚本
 说明：
     - 默认 git add -A（暂存所有变更），也可指定文件
     - 自动修复 GIT_SSH_COMMAND 末尾多余引号的问题
+    - 自动注入 Deepnote gitkey，无需手动设置 GIT_SSH_COMMAND
     - 推送到当前分支的 upstream（origin/<branch>）
 """
 
@@ -24,6 +25,8 @@ RED    = "\033[31m"
 YELLOW = "\033[33m"
 GRAY   = "\033[90m"
 RESET  = "\033[0m"
+
+GITKEY = "/work/.deepnote/gitkey"
 
 
 # ─── 工具函数 ──────────────────────────────────────────────────────────────────
@@ -44,27 +47,19 @@ def run(cmd, env=None, cwd=None):
 
 def fixed_env():
     """
-    返回修复后的环境变量字典。
-    修复 GIT_SSH_COMMAND 末尾可能存在的多余引号，
-    避免 SSH 报 Syntax error: Unterminated quoted string。
+    返回修复后的环境变量字典：
+    1. 若 gitkey 文件存在，直接覆盖写入正确的 GIT_SSH_COMMAND，
+       彻底避免 Deepnote 环境中末尾多余引号导致的 SSH 语法错误。
+    2. 若 gitkey 不存在（非 Deepnote 环境），保留系统原有配置。
     """
     env = os.environ.copy()
-    ssh_cmd = env.get("GIT_SSH_COMMAND", "").rstrip()
-
-    # 去掉末尾多余的双引号
-    if ssh_cmd.endswith(chr(34)):
-        ssh_cmd = ssh_cmd[:-1].rstrip()
-        env["GIT_SSH_COMMAND"] = ssh_cmd
-
-    # 若完全未设置，使用默认 gitkey 路径（Deepnote 环境）
-    if not ssh_cmd:
-        gitkey = "/work/.deepnote/gitkey"
-        if os.path.exists(gitkey):
-            env["GIT_SSH_COMMAND"] = (
-                "ssh -i " + gitkey +
-                " -o UserKnownHostsFile=/dev/null"
-                " -o StrictHostKeyChecking=no"
-            )
+    if os.path.exists(GITKEY):
+        env["GIT_SSH_COMMAND"] = (
+            "ssh -i " + GITKEY +
+            " -o UserKnownHostsFile=/dev/null"
+            " -o StrictHostKeyChecking=no"
+        )
+        print(GRAY + "[git] 使用 gitkey: " + GITKEY + RESET)
     return env
 
 
