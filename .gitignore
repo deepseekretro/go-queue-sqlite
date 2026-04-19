@@ -13,3 +13,4 @@ goapp
 # 编译产物（非 goapp 主二进制）
 goapp_bin
 examples/bench/bench_bin
+main
