@@ -342,13 +342,22 @@ function renderTable() {
       <td>${statusBadge}</td>
       <td style="white-space:nowrap;">
         <button class="btn btn-sm" style="background:#1e3a5f;border:1px solid #3b82f6;color:#60a5fa;margin-right:4px;"
-          onclick="showDetail(${JSON.stringify(r.key)})">👁 View</button>
+          data-action="view" data-key="${escHtml(r.key)}">👁 View</button>
         <button class="btn btn-sm btn-danger"
-          onclick="deleteKey(${JSON.stringify(r.key)})">🗑</button>
+          data-action="del" data-key="${escHtml(r.key)}">🗑</button>
       </td>
     </tr>`;
   }).join('');
 }
+
+// ── 事件委托：tbody 点击 ─────────────────────────────────────────────────────
+document.getElementById('keys-tbody').addEventListener('click', function(e) {
+  const btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  const key = btn.dataset.key;
+  if (btn.dataset.action === 'view') showDetail(key);
+  if (btn.dataset.action === 'del')  deleteKey(key);
+});
 
 // ── Detail modal ───────────────────────────────────────────────────────────
 function showDetail(key) {
