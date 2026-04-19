@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"time"
 )
 
 // wsConn 封装底层 TCP 连接，实现最小 WebSocket 帧读写
 type wsConn struct {
 	conn net.Conn
 	br   *bufio.Reader
+
+	// pongHandler 在收到 Pong 帧时被调用（可选）
+	pongHandler func(string) error
 }
 
 // upgradeWS 将 HTTP 连接升级为 WebSocket（RFC 6455）
@@ -42,6 +46,21 @@ func upgradeWS(w http.ResponseWriter, r *http.Request) (*wsConn, error) {
 	conn.Write([]byte(resp))
 
 	return &wsConn{conn: conn, br: buf.Reader}, nil
+}
+
+// SetReadDeadline 设置底层 TCP 连接的读超时
+func (c *wsConn) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
+
+// SetPongHandler 注册 Pong 帧处理函数
+func (c *wsConn) SetPongHandler(fn func(string) error) {
+	c.pongHandler = fn
+}
+
+// WritePing 发送 Ping 帧（opcode=9），服务端主动探活
+func (c *wsConn) WritePing(data []byte) error {
+	return c.WriteMessage(9, data)
 }
 
 // ReadMessage 读取一个 WebSocket 帧，返回 (opcode, payload, error)
@@ -88,6 +107,11 @@ func (c *wsConn) ReadMessage() (int, []byte, error) {
 		return opcode, nil, fmt.Errorf("websocket: connection closed by client")
 	case 9: // Ping → 自动回复 Pong（opcode=10），RFC 6455 §5.5.3
 		_ = c.WritePong(payload)
+		return c.ReadMessage() // 继续读下一帧
+	case 10: // Pong → 调用 pongHandler（如已注册），然后继续读下一帧
+		if c.pongHandler != nil {
+			_ = c.pongHandler(string(payload))
+		}
 		return c.ReadMessage() // 继续读下一帧
 	}
 	return opcode, payload, nil

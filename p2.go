@@ -149,10 +149,11 @@ func checkRateLimit(j *Job) bool {
 		return false // 未超限，正常执行
 	}
 	// 超限：放回 pending，延迟 60s 重试
+	// Bug 15 修复：限流不是任务失败，不减少 attempts，避免任务因限流耗尽重试次数进入 DLQ
 	now := time.Now().Unix()
-	dbExec(`UPDATE jobs SET status='pending', attempts=attempts-1, available_at=?, updated_at=? WHERE id=?`,
+	dbExec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE id=?`,
 		now+60, now, j.ID) //nolint
-	log.Printf("[RateLimit] job #%d type=%s rate limited, rescheduled in 60s", j.ID, p.JobType)
+	log.Printf("[RateLimit] job #%d type=%s rate limited, rescheduled in 60s (attempts unchanged)", j.ID, p.JobType)
 	return true
 }
 
@@ -282,14 +283,24 @@ func handleWorkersList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	beats := getWorkerHeartbeats()
+	now := time.Now().Unix()
 	hub.mu.Lock()
 	workers := []map[string]interface{}{}
 	for id, wk := range hub.workers {
+		uptimeSec := int64(0)
+		if wk.connectedAt > 0 {
+			uptimeSec = now - wk.connectedAt
+		}
 		info := map[string]interface{}{
 			"id":             id,
 			"queue":          wk.queue,
 			"idle":           wk.idle,
 			"current_job_id": wk.currentJobID,
+			"timeout_sec":    wk.timeoutSec,
+			"connected_at":   wk.connectedAt,
+			"uptime_sec":     uptimeSec,
+			"jobs_done":      wk.jobsDone,
+			"heartbeat":      nil, // 始终返回该字段，无记录时为 null
 		}
 		if hb, ok := beats[id]; ok {
 			info["heartbeat"] = hb
@@ -506,7 +517,21 @@ func checkBatchCompletion(jobID int64) {
 	if failed > 0 {
 		finalStatus = "failed"
 	}
-	dbExec(`UPDATE job_batches SET status=?, finished_at=? WHERE id=?`, finalStatus, now, batchID) //nolint
+	// Bug 23 修复：使用原子 UPDATE（WHERE status NOT IN ('done','failed')）防止并发竞态
+	// 只有第一个成功更新的 goroutine（RowsAffected > 0）才触发回调，避免重复触发
+	res, err := dbExecResult(
+		`UPDATE job_batches SET status=?, finished_at=? WHERE id=? AND status NOT IN ('done','failed')`,
+		finalStatus, now, batchID,
+	)
+	if err != nil {
+		log.Printf("[Batch] Batch #%d update error: %v", batchID, err)
+		return
+	}
+	rowsAffected, _ := res.RowsAffected()
+	if rowsAffected == 0 {
+		// 已被其他 goroutine 更新，跳过回调触发
+		return
+	}
 	log.Printf("[Batch] Batch #%d completed: status=%s total=%d done=%d failed=%d",
 		batchID, finalStatus, total, done, failed)
 

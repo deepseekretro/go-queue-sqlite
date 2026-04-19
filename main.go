@@ -306,14 +306,14 @@ func (slogWriter) Write(p []byte) (n int, err error) {
 
 func initDB() {
 	var err error
-	db, err = sql.Open("sqlite", "./queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)")
+	db, err = sql.Open("sqlite", "./queue.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(200)")
 	if err != nil {
 		log.Fatal(err)
 	}
-	// 写操作通过 dbArbiterCh 单 goroutine 串行执行，读操作可并发
-	// 设置 MaxOpenConns=4：1个写连接 + 多个读连接，充分利用 WAL 并发读
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	// WAL 模式下单连接即可：读写并发由 WAL 保证，单连接避免多连接持有读事务阻止 checkpoint
+	// wal_autocheckpoint(200)：WAL 达到 200 pages 时自动 checkpoint，防止 WAL 无限增长
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// 建表（首次运行）
 	schema := `
@@ -334,6 +334,7 @@ func initDB() {
 	);
 	CREATE TABLE IF NOT EXISTS failed_jobs (
 		id        INTEGER PRIMARY KEY AUTOINCREMENT,
+		job_id    INTEGER NOT NULL DEFAULT 0,
 		queue     TEXT    NOT NULL,
 		job_type  TEXT    NOT NULL DEFAULT '',
 		payload   TEXT    NOT NULL,
@@ -349,6 +350,7 @@ func initDB() {
 	migrations := []string{
 		`ALTER TABLE failed_jobs ADD COLUMN job_type TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE failed_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE failed_jobs ADD COLUMN job_id INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN started_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 5`,
@@ -361,6 +363,16 @@ func initDB() {
 			if !strings.Contains(err.Error(), "duplicate column") {
 				log.Printf("[DB] migration warning: %v", err)
 			}
+		}
+	}
+
+	// 重启恢复：把上次崩溃/重启时遗留的 running 任务放回 pending
+	// 这些任务的 worker 连接已经不存在，必须重新派发
+	// Bug 18 修复：启动恢复时不减少 attempts，这些任务是因为进程崩溃/重启而中断，不是任务本身失败
+	if res, err := db.Exec(`UPDATE jobs SET status='pending', updated_at=? WHERE status='running'`,
+		time.Now().Unix()); err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("[DB] Startup recovery: reset %d running job(s) back to pending", n)
 		}
 	}
 
@@ -626,7 +638,16 @@ func handleJobFailure(j *Job, reason string) {
 			delaySec = int64(pf.Backoff[idx])
 		} else {
 			// 指数退避：第 N 次重试延迟 2^(N-1) * RetryBaseDelaySec 秒
-			delaySec = int64(1<<uint(j.Attempts-1)) * RetryBaseDelaySec
+			// Bug 22 修复：限制位移量防止 int64 溢出，并设置最大延迟上限（3600s）
+			const maxDelaySec = int64(3600)
+			shift := uint(j.Attempts - 1)
+			if shift > 30 {
+				shift = 30 // 防止 int64 溢出（2^30 * 10 = 10737418240s，已超上限）
+			}
+			delaySec = int64(1<<shift) * RetryBaseDelaySec
+			if delaySec > maxDelaySec {
+				delaySec = maxDelaySec
+			}
 		}
 		availAt := now + delaySec
 		dbExec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE id=?`,
@@ -637,8 +658,8 @@ func handleJobFailure(j *Job, reason string) {
 		// 超过最大重试次数，进死信队列
 		jobType := j.JobType()
 		dbExec(`UPDATE jobs SET status='failed', finished_at=?, updated_at=? WHERE id=?`, now, now, j.ID)         //nolint
-		dbExec(`INSERT INTO failed_jobs (queue, job_type, payload, attempts, exception, failed_at) VALUES (?,?,?,?,?,?)`,
-			j.Queue, jobType, j.Payload, j.Attempts, reason, now) //nolint
+		dbExec(`INSERT INTO failed_jobs (job_id, queue, job_type, payload, attempts, exception, failed_at) VALUES (?,?,?,?,?,?,?)`,
+			j.ID, j.Queue, jobType, j.Payload, j.Attempts, reason, now) //nolint
 		log.Printf("[Queue] Job #%d → DLQ after %d attempts — reason: %s", j.ID, j.Attempts, reason)
 	}
 	broadcastStats()
@@ -686,6 +707,8 @@ type WsWorker struct {
 	currentJobID int64        // 当前正在处理的任务 ID，断连时用于放回 pending
 	idle         bool         // true = 空闲，可接受新任务
 	timeoutSec   int          // 当前任务的超时秒数（0 = 使用 WsJobTimeoutSec 全局默认）
+	connectedAt  int64        // worker 连接时的 Unix 时间戳（秒）
+	jobsDone     int64        // 本次连接内已完成的任务数
 }
 
 type WorkerHub struct {
@@ -727,12 +750,23 @@ func notifyQueue(queue string) {
 
 func (h *WorkerHub) register(w *WsWorker) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	w.idle = true
 	w.kick = make(chan struct{}, 1) // 初始化 kick channel
+	w.connectedAt = time.Now().Unix()  // 记录连接时间
 	h.workers[w.id] = w
 	h.rrKeys = append(h.rrKeys, w.id)
-	log.Printf("[Hub] Worker registered: id=%s queue=%s total=%d", w.id, w.queue, len(h.workers))
+	total := len(h.workers)
+	h.mu.Unlock()
+	log.Printf("[Hub] Worker registered: id=%s queue=%s total=%d", w.id, w.queue, total)
+	// 新 worker 上线，立即通知 dispatcher 尝试派发 pending 任务（无需等 100ms 轮询）
+	if w.queue != "" {
+		notifyQueue(w.queue)
+	} else {
+		// queue="" 的 worker 可处理所有队列，通知所有活跃队列
+		for _, q := range h.activeQueues() {
+			notifyQueue(q)
+		}
+	}
 }
 
 // kickWorker 向指定 worker 发送 kick 信号，使其主动断开连接
@@ -753,7 +787,6 @@ func (h *WorkerHub) kickWorker(id string) bool {
 
 func (h *WorkerHub) unregister(id string) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	delete(h.workers, id)
 	// 从 rrKeys 中移除
 	for i, k := range h.rrKeys {
@@ -765,7 +798,9 @@ func (h *WorkerHub) unregister(id string) {
 			break
 		}
 	}
-	log.Printf("[Hub] Worker unregistered: id=%s total=%d", id, len(h.workers))
+	total := len(h.workers)
+	h.mu.Unlock()
+	log.Printf("[Hub] Worker unregistered: id=%s total=%d", id, total)
 }
 
 func (h *WorkerHub) count() int {
@@ -793,23 +828,45 @@ func (h *WorkerHub) idleCountForQueue(queue string) int {
 	defer h.mu.Unlock()
 	count := 0
 	for _, w := range h.workers {
-		if w.queue == queue && w.idle {
+		// queue="" 的 worker 可处理任意队列的任务，也计入空闲数
+		if (w.queue == queue || w.queue == "") && w.idle {
 			count++
 		}
 	}
 	return count
 }
 
-// activeQueues 返回当前所有有 WS Worker 连接的队列列表（去重）
+// activeQueues 返回当前所有有 WS Worker 连接的队列列表（去重）。
+// 对于 queue="" 的通配 worker，额外从 DB 查询所有有 pending 任务的队列，
+// 确保 DynamicDispatcher 能为这些队列启动 dispatcher。
 func (h *WorkerHub) activeQueues() []string {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	seen := map[string]bool{}
 	var queues []string
+	hasWildcard := false
 	for _, w := range h.workers {
-		if w.queue != "" && !seen[w.queue] {
-			seen[w.queue] = true
-			queues = append(queues, w.queue)
+		if w.queue != "" {
+			if !seen[w.queue] {
+				seen[w.queue] = true
+				queues = append(queues, w.queue)
+			}
+		} else {
+			hasWildcard = true
+		}
+	}
+	h.mu.Unlock()
+	// 通配 worker（queue=""）可处理任意队列：把 DB 中有 pending 任务的队列也加入列表
+	if hasWildcard {
+		rows, err := db.Query(`SELECT DISTINCT queue FROM jobs WHERE status='pending' LIMIT 64`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var q string
+				if rows.Scan(&q) == nil && !seen[q] {
+					seen[q] = true
+					queues = append(queues, q)
+				}
+			}
 		}
 	}
 	return queues
@@ -915,9 +972,14 @@ func startWsDispatcher(queue string) {
 				// 逐个派发给空闲 worker
 				dispatched := 0
 				for _, j := range jobs {
+					// Bug 17 修复：WS Worker 也需要经过限流检查
+					if checkRateLimit(j) {
+						// 超限，任务已被 checkRateLimit 放回 pending（延迟 60s）
+						continue
+					}
 					if !hub.dispatchToWs(j) {
-						// 没有空闲 worker 了，放回 pending
-						dbExec(`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=? WHERE id=?`,
+						// 没有空闲 worker 了，放回 pending（不减少 attempts）
+						dbExec(`UPDATE jobs SET status='pending', updated_at=? WHERE id=?`,
 							time.Now().Unix(), j.ID) //nolint
 					} else {
 						dispatched++
@@ -925,6 +987,9 @@ func startWsDispatcher(queue string) {
 				}
 				// 如果本轮没有成功派发任何任务，退出循环避免空转
 				if dispatched == 0 {
+					// 所有取出的任务都已放回 pending（在上面的 dispatchToWs 失败处理中）
+					// 立即触发一次通知，让下次轮询尽快重试（而不是等 100ms）
+					go func() { notifyQueue(queue) }()
 					break
 				}
 			}
@@ -943,7 +1008,24 @@ func startDynamicWsDispatcher() {
 			}
 			// 获取当前所有已连接 worker 的队列列表
 			queues := hub.activeQueues()
+			// 同时扫描 DB 中有 pending 任务的队列，提前启动 dispatcher
+			// 这样 worker 一连接就能立即响应，无需等待下次扫描
+			if rows, err := db.Query(`SELECT DISTINCT queue FROM jobs WHERE status='pending' LIMIT 64`); err == nil {
+				for rows.Next() {
+					var q string
+					if rows.Scan(&q) == nil {
+						queues = append(queues, q)
+					}
+				}
+				rows.Close()
+			}
+			// 去重并启动 dispatcher
+			seen := map[string]bool{}
 			for _, q := range queues {
+				if q == "" || seen[q] {
+					continue
+				}
+				seen[q] = true
 				if !started[q] {
 					startWsDispatcher(q)
 					started[q] = true
@@ -990,6 +1072,33 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	})
 	conn.WriteMessage(1, welcome)
 
+	// 设置 Pong handler：收到 pong 时重置读超时，证明连接仍然活跃
+	const wsPingInterval = 30 * time.Second
+	const wsPongTimeout = 60 * time.Second
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
+		return nil
+	})
+	// 设置初始读超时
+	conn.SetReadDeadline(time.Now().Add(wsPongTimeout))
+
+	// ping goroutine：定期发送 ping，检测半开连接（TCP 连接存在但对端已死）
+	go func() {
+		ticker := time.NewTicker(wsPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				// 发送 ping，同时推进读超时
+				if err := conn.WritePing(nil); err != nil {
+					return // 写失败，连接已断，read goroutine 会关闭 worker.done
+				}
+			case <-worker.done:
+				return // worker 已断线，退出
+			}
+		}
+	}()
+
 	// read goroutine：处理 result / ping 心跳消息
 	go func() {
 		for {
@@ -1023,11 +1132,21 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 	rescheduleCurrentJob := func(reason string) {
 		hub.mu.Lock()
 		jobID := worker.currentJobID
+		jobQueue := worker.queue
 		hub.mu.Unlock()
 		if jobID > 0 {
-			dbExec(`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=? WHERE id=? AND status='running'`,
+			// Bug 18 修复：WS Worker 断开时不减少 attempts，任务会被重新派发
+			dbExec(`UPDATE jobs SET status='pending', updated_at=? WHERE id=? AND status='running'`,
 				time.Now().Unix(), jobID) //nolint
 			log.Printf("[WS] Worker %s %s — job #%d put back to pending", workerID, reason, jobID)
+			// 立即通知 dispatcher 重新派发该任务
+			if jobQueue != "" {
+				notifyQueue(jobQueue)
+			} else {
+				for _, q := range hub.activeQueues() {
+					notifyQueue(q)
+				}
+			}
 		}
 	}
 
@@ -1065,9 +1184,17 @@ func handleWorkerWS(w http.ResponseWriter, r *http.Request) {
 				worker.idle = true
 				worker.currentJobID = 0
 				worker.timeoutSec = 0
+				worker.jobsDone++
 				hub.mu.Unlock()
 				// worker 变为 idle，立即通知 dispatcher 可以派发下一个任务
-				notifyQueue(worker.queue)
+				if worker.queue != "" {
+					notifyQueue(worker.queue)
+				} else {
+					// 通配 worker（queue=""）：通知所有活跃队列的 dispatcher
+					for _, q := range hub.activeQueues() {
+						notifyQueue(q)
+					}
+				}
 				if result.Success {
 					markDone(result.JobID)
 					log.Printf("[WS] Job #%d done by worker %s: %s", result.JobID, workerID, result.Log)
@@ -1272,6 +1399,36 @@ func startIdleVacuumer() {
 		VacuumIntervalSec, VacuumMinIdleSec)
 }
 
+// startWalCheckpointer 后台定期执行 WAL checkpoint，防止 WAL 文件无限增长
+// WAL 文件过大会导致每次读操作都需要扫描整个 WAL，读性能急剧下降
+// 每 30s 执行一次 PASSIVE checkpoint（不阻塞读写，尽量合并 WAL 到主文件）
+func startWalCheckpointer() {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopGoWorker:
+				return
+			case <-ticker.C:
+				// PASSIVE：不阻塞任何读写，尽量把 WAL 合并到主文件
+				// 如果有活跃读事务，部分 pages 可能无法 checkpoint，下次再试
+				var busy, log2, ckpt int
+				if err := db.QueryRow(`PRAGMA wal_checkpoint(PASSIVE)`).Scan(&busy, &log2, &ckpt); err == nil {
+					if log2 > 0 {
+						slog.Info("[WALCheckpointer] checkpoint done",
+							"busy", busy, "log_pages", log2, "checkpointed", ckpt)
+					}
+				} else {
+					slog.Warn("[WALCheckpointer] checkpoint failed", "err", err)
+				}
+			}
+		}
+	}()
+	slog.Info("[WALCheckpointer] Started — WAL checkpoint every 30s")
+}
+
+
 // handleAdminVacuum 处理 POST /api/admin/vacuum 手动触发压缩请求
 func handleAdminVacuum(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -1312,11 +1469,19 @@ func handleAdminVacuum(w http.ResponseWriter, r *http.Request) {
 
 func startStaleJobReaper() {
 	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
 		for {
-			time.Sleep(30 * time.Second)
+			select {
+			case <-stopGoWorker: // Bug 19 修复：优雅退出
+				return
+			case <-ticker.C:
+			}
 			threshold := time.Now().Unix() - int64(StaleJobTimeout)
+			// Bug 18 修复：stale job 放回 pending 时不减少 attempts
+			// stale 是 worker 崩溃/超时导致，不是任务本身失败，不应消耗重试次数
 			res, err := dbExecResult(
-				`UPDATE jobs SET status='pending', attempts=attempts-1, updated_at=?
+				`UPDATE jobs SET status='pending', updated_at=?
 				 WHERE status='running' AND updated_at<?`,
 				time.Now().Unix(), threshold,
 			)
@@ -1326,7 +1491,11 @@ func startStaleJobReaper() {
 			}
 			n, _ := res.RowsAffected()
 			if n > 0 {
-				log.Printf("[Reaper] Rescued %d stale job(s) back to pending", n)
+				log.Printf("[Reaper] Rescued %d stale job(s) back to pending (attempts unchanged)", n)
+				// 通知所有活跃队列有新的 pending 任务
+				for _, q := range hub.activeQueues() {
+					notifyQueue(q)
+				}
 			}
 		}
 	}()
@@ -1628,7 +1797,6 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	defer rows.Close()
 	// 预设默认值，确保表为空时也返回 0 而非 null
 	stats := map[string]interface{}{
 		"pending": 0,
@@ -1642,6 +1810,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		rows.Scan(&s, &c)
 		stats[s] = c
 	}
+	rows.Close() // 立即释放连接，不用 defer（defer 会延迟到函数返回）
 	var failed int
 	db.QueryRow(`SELECT COUNT(*) FROM failed_jobs`).Scan(&failed)
 	stats["failed_jobs_table"] = failed
@@ -1662,7 +1831,6 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	// 各队列 pending 数量
 	qRows, _ := db.Query(`SELECT queue, COUNT(*) FROM jobs WHERE status='pending' GROUP BY queue`)
 	if qRows != nil {
-		defer qRows.Close()
 		queuePending := map[string]int{}
 		for qRows.Next() {
 			var q string
@@ -1670,6 +1838,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 			qRows.Scan(&q, &c)
 			queuePending[q] = c
 		}
+		qRows.Close() // 立即释放连接
 		stats["queue_pending"] = queuePending
 	}
 
@@ -1692,7 +1861,9 @@ func handleClearFailed(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", 405)
 		return
 	}
+	// Bug 21 修复：同时清理 jobs 表中 status='failed' 的记录
 	dbExec(`DELETE FROM failed_jobs`) //nolint
+	dbExec(`DELETE FROM jobs WHERE status='failed'`) //nolint
 	jsonResp(w, 200, map[string]string{"message": "failed jobs cleared"})
 }
 
@@ -1702,7 +1873,11 @@ func handleRetryFailed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().Unix()
-	dbExec(`UPDATE jobs SET status='pending', available_at=?, updated_at=? WHERE status='failed'`, now, now) //nolint
+	// Bug 20 修复：重置 attempts=0，让任务从头开始重试
+	// 否则 attempts >= maxAttempts，reserve 后立即再次进 DLQ
+	dbExec(`UPDATE jobs SET status='pending', attempts=0, available_at=?, updated_at=? WHERE status='failed'`, now, now) //nolint
+	// 同时清理 failed_jobs 表中对应的记录，避免重复
+	dbExec(`DELETE FROM failed_jobs WHERE job_id IN (SELECT id FROM jobs WHERE status='pending' AND attempts=0 AND updated_at=?)`, now) //nolint
 	jsonResp(w, 200, map[string]string{"message": "failed jobs re-queued"})
 }
 
@@ -1789,7 +1964,6 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	// jobs_total by status
 	rows, _ := db.Query(`SELECT status, COUNT(*) FROM jobs GROUP BY status`)
 	if rows != nil {
-		defer rows.Close()
 		fmt.Fprintln(w, "# HELP jobs_total Total number of jobs by status")
 		fmt.Fprintln(w, "# TYPE jobs_total gauge")
 		for rows.Next() {
@@ -1798,12 +1972,12 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 			rows.Scan(&s, &c)
 			fmt.Fprintf(w, `jobs_total{status=%q} %d`+"\n", s, c)
 		}
+		rows.Close() // 立即释放连接
 	}
 
 	// jobs_total by queue+status
 	qRows, _ := db.Query(`SELECT queue, status, COUNT(*) FROM jobs GROUP BY queue, status`)
 	if qRows != nil {
-		defer qRows.Close()
 		fmt.Fprintln(w, "# HELP jobs_by_queue_total Total jobs by queue and status")
 		fmt.Fprintln(w, "# TYPE jobs_by_queue_total gauge")
 		for qRows.Next() {
@@ -1812,6 +1986,7 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 			qRows.Scan(&q, &s, &c)
 			fmt.Fprintf(w, `jobs_by_queue_total{queue=%q,status=%q} %d`+"\n", q, s, c)
 		}
+		qRows.Close() // 立即释放连接
 	}
 
 	// failed_jobs_total (DLQ)
@@ -1904,6 +2079,7 @@ func main() {
 	startStaleJobReaper()
 	startHeartbeatReaper()
 	startIdleVacuumer()    // 空闲时自动压缩 SQLite
+	startWalCheckpointer() // 定期 WAL checkpoint，防止 WAL 过大导致读超时
 	startSessionReaper()
 	// 内置 GoWorker 已移除 — 任务由外部 WS Worker 处理
 	// 启动动态 WsDispatcher（自动感知所有有 WS Worker 连接的队列）

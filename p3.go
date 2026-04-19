@@ -83,12 +83,12 @@ func handleQueueList(w http.ResponseWriter, r *http.Request) {
 	rows, _ := db.Query(`SELECT DISTINCT queue FROM jobs`)
 	dbQueues := map[string]bool{}
 	if rows != nil {
-		defer rows.Close()
 		for rows.Next() {
 			var q string
 			rows.Scan(&q)
 			dbQueues[q] = true
 		}
+		rows.Close() // 立即释放连接
 	}
 	for _, q := range activeQs {
 		dbQueues[q] = true
@@ -619,9 +619,17 @@ func handleCronRunLogs(w http.ResponseWriter, r *http.Request, cronID int64) {
 // startCronScheduler 启动 cron 调度器 goroutine，每 10s 扫描一次
 func startCronScheduler() {
 	go func() {
+		// 启动时立即扫描一次，处理服务重启期间积压的到期任务（Bug 11 修复）
+		runDueCrons()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
 		for {
-			time.Sleep(10 * time.Second)
-			runDueCrons()
+			select {
+			case <-stopGoWorker: // 优雅退出（Bug 12 修复）
+				return
+			case <-ticker.C:
+				runDueCrons()
+			}
 		}
 	}()
 	log.Println("[Cron] Scheduler started — scan interval=10s")
@@ -676,9 +684,12 @@ func runDueCrons() {
 		// 原因：pending job 可能因为没有 Worker 而长期积压，不应阻止下次触发
 		if c.WithoutOverlapping {
 			var cnt int
+			// Bug 13 修复：用 "," || tags || "," LIKE "%,cron:ID,%" 精确匹配，
+			// 避免 cron:10 误匹配 cron:100、cron:101 等
+			cronTag := ",cron:" + strconv.FormatInt(c.ID, 10) + ","
 			db.QueryRow(
-				`SELECT COUNT(*) FROM jobs WHERE tags LIKE ? AND status = 'running'`,
-				"%cron:"+strconv.FormatInt(c.ID, 10)+"%",
+				`SELECT COUNT(*) FROM jobs WHERE "," || tags || "," LIKE ? AND status = 'running'`,
+				"%"+cronTag+"%",
 			).Scan(&cnt)
 			if cnt > 0 {
 				log.Printf("[Cron] Cron #%d skipped (overlapping, %d active jobs)", c.ID, cnt)
@@ -693,29 +704,32 @@ func runDueCrons() {
 		// 触发
 		jobID, err := fireCronJob(c, false)
 		if err != nil {
+			// dispatch 失败：只推进 next_run_at，不递增 run_count，不 disable one_time
 			log.Printf("[Cron] dispatch error for cron #%d: %v", c.ID, err)
 			writeCronRunLog(c.ID, 0, now, true, "dispatch_error: "+err.Error())
+			nextRun, _ := calcNextRun(c.Expr, c.Every, c.Timezone, time.Now())
+			dbExec(`UPDATE cron_jobs SET next_run_at=? WHERE id=?`, nextRun, c.ID) //nolint
 		} else {
 			log.Printf("[Cron] Cron #%d fired → job #%d (type=%s)", c.ID, jobID, c.JobType)
 			writeCronRunLog(c.ID, jobID, now, false, "")
-		}
 
-		// 更新 last_run_at / next_run_at / run_count
-		nextRun, _ := calcNextRun(c.Expr, c.Every, c.Timezone, time.Now())
-		newRunCount := c.RunCount + 1
-		dbExec(`UPDATE cron_jobs SET last_run_at=?, next_run_at=?, run_count=? WHERE id=?`,
-			now, nextRun, newRunCount, c.ID) //nolint
+			// 仅 dispatch 成功时才更新 last_run_at / next_run_at / run_count
+			nextRun, _ := calcNextRun(c.Expr, c.Every, c.Timezone, time.Now())
+			newRunCount := c.RunCount + 1
+			dbExec(`UPDATE cron_jobs SET last_run_at=?, next_run_at=?, run_count=? WHERE id=?`,
+				now, nextRun, newRunCount, c.ID) //nolint
 
-		// one_time：触发一次后 disabled
-		if c.OneTime {
-			dbExec(`UPDATE cron_jobs SET enabled=0 WHERE id=?`, c.ID) //nolint
-			log.Printf("[Cron] Cron #%d is one_time, disabled after first run", c.ID)
-		}
+			// one_time：触发一次后 disabled
+			if c.OneTime {
+				dbExec(`UPDATE cron_jobs SET enabled=0 WHERE id=?`, c.ID) //nolint
+				log.Printf("[Cron] Cron #%d is one_time, disabled after first run", c.ID)
+			}
 
-		// max_runs 达到上限
-		if c.MaxRuns > 0 && newRunCount >= c.MaxRuns {
-			dbExec(`UPDATE cron_jobs SET enabled=0 WHERE id=?`, c.ID) //nolint
-			log.Printf("[Cron] Cron #%d reached max_runs=%d, disabled", c.ID, c.MaxRuns)
+			// max_runs 达到上限
+			if c.MaxRuns > 0 && newRunCount >= c.MaxRuns {
+				dbExec(`UPDATE cron_jobs SET enabled=0 WHERE id=?`, c.ID) //nolint
+				log.Printf("[Cron] Cron #%d reached max_runs=%d, disabled", c.ID, c.MaxRuns)
+			}
 		}
 	}
 }
